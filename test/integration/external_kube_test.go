@@ -1,5 +1,3 @@
-// +build integration,etcd
-
 package integration
 
 import (
@@ -10,20 +8,21 @@ import (
 	"time"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	kclient "k8s.io/kubernetes/pkg/client"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
+	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/probe"
 	httpprobe "k8s.io/kubernetes/pkg/probe/http"
 	"k8s.io/kubernetes/pkg/watch"
 
 	configapi "github.com/openshift/origin/pkg/cmd/server/api"
 	testutil "github.com/openshift/origin/test/util"
+	testserver "github.com/openshift/origin/test/util/server"
 )
 
 func TestExternalKube(t *testing.T) {
+	testutil.RequireEtcd(t)
+	defer testutil.DumpEtcdOnFailure(t)
 	// Start one OpenShift master as "cluster1" to play the external kube server
-	cluster1MasterConfig, cluster1AdminConfigFile, err := testutil.StartTestMaster()
+	cluster1MasterConfig, cluster1AdminConfigFile, err := testserver.StartTestMasterAPI()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -40,7 +39,7 @@ func TestExternalKube(t *testing.T) {
 	}
 
 	// Set up cluster 2 to run against cluster 1 as external kubernetes
-	cluster2MasterConfig, err := testutil.DefaultMasterOptions()
+	cluster2MasterConfig, err := testserver.DefaultMasterOptions()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -67,8 +66,8 @@ func TestExternalKube(t *testing.T) {
 	cluster2MasterConfig.DNSConfig = nil
 
 	// Start cluster 2 (without clearing etcd) and get admin client configs and clients
-	cluster2Options := testutil.TestOptions{DeleteAllEtcdKeys: false}
-	cluster2AdminConfigFile, err := testutil.StartConfiguredMasterWithOptions(cluster2MasterConfig, cluster2Options)
+	cluster2Options := testserver.TestOptions{EnableControllers: true}
+	cluster2AdminConfigFile, err := testserver.StartConfiguredMasterWithOptions(cluster2MasterConfig, cluster2Options)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -90,7 +89,7 @@ func healthzProxyTest(masterConfig *configapi.MasterConfig, t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	url.Path = "/healthz"
-	response, body, err := httpprobe.New().Probe(url, 1*time.Second)
+	response, body, err := httpprobe.New().Probe(url, nil, 1*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -99,12 +98,12 @@ func healthzProxyTest(masterConfig *configapi.MasterConfig, t *testing.T) {
 	}
 }
 
-func watchProxyTest(cluster1AdminKubeClient, cluster2AdminKubeClient *kclient.Client, t *testing.T) {
+func watchProxyTest(cluster1AdminKubeClient, cluster2AdminKubeClient *kclientset.Clientset, t *testing.T) {
 	// list namespaces in order to determine correct resourceVersion
-	namespaces, err := cluster1AdminKubeClient.Namespaces().List(labels.Everything(), fields.Everything())
+	namespaces, err := cluster1AdminKubeClient.Namespaces().List(kapi.ListOptions{})
 
 	// open a watch on Cluster 2 for namespaces starting with latest resourceVersion
-	namespaceWatch, err := cluster2AdminKubeClient.Namespaces().Watch(labels.Everything(), fields.Everything(), namespaces.ResourceVersion)
+	namespaceWatch, err := cluster2AdminKubeClient.Namespaces().Watch(kapi.ListOptions{ResourceVersion: namespaces.ResourceVersion})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -11,27 +11,29 @@ import (
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/meta"
-	"k8s.io/kubernetes/pkg/client"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/kubectl"
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
 	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util"
 	kerrors "k8s.io/kubernetes/pkg/util/errors"
+	"k8s.io/kubernetes/pkg/util/sets"
 
 	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
 )
 
 type NodeOptions struct {
 	DefaultNamespace string
-	Kclient          *client.Client
+	KubeClient       kclientset.Interface
 	Writer           io.Writer
+	ErrWriter        io.Writer
 
 	Mapper            meta.RESTMapper
 	Typer             runtime.ObjectTyper
 	RESTClientFactory func(mapping *meta.RESTMapping) (resource.RESTClient, error)
-	Printer           func(mapping *meta.RESTMapping, noHeaders, withNamespace, wide bool, columnLabels []string) (kubectl.ResourcePrinter, error)
+	Printer           func(mapping *meta.RESTMapping, printOptions kubectl.PrintOptions) (kubectl.ResourcePrinter, error)
 
 	CmdPrinter       kubectl.ResourcePrinter
 	CmdPrinterOutput bool
@@ -43,7 +45,7 @@ type NodeOptions struct {
 	PodSelector string
 }
 
-func (n *NodeOptions) Complete(f *clientcmd.Factory, c *cobra.Command, args []string, out io.Writer) error {
+func (n *NodeOptions) Complete(f *clientcmd.Factory, c *cobra.Command, args []string, out, errout io.Writer) error {
 	defaultNamespace, _, err := f.DefaultNamespace()
 	if err != nil {
 		return err
@@ -59,11 +61,12 @@ func (n *NodeOptions) Complete(f *clientcmd.Factory, c *cobra.Command, args []st
 	mapper, typer := f.Object()
 
 	n.DefaultNamespace = defaultNamespace
-	n.Kclient = kc
+	n.KubeClient = kc
 	n.Writer = out
+	n.ErrWriter = errout
 	n.Mapper = mapper
 	n.Typer = typer
-	n.RESTClientFactory = f.Factory.RESTClient
+	n.RESTClientFactory = f.ClientForMapping
 	n.Printer = f.Printer
 	n.NodeNames = []string{}
 	n.CmdPrinter = cmdPrinter
@@ -107,7 +110,7 @@ func (n *NodeOptions) GetNodes() ([]*kapi.Node, error) {
 		nameArgs = append(nameArgs, n.NodeNames...)
 	}
 
-	r := resource.NewBuilder(n.Mapper, n.Typer, resource.ClientMapperFunc(n.RESTClientFactory)).
+	r := resource.NewBuilder(n.Mapper, n.Typer, resource.ClientMapperFunc(n.RESTClientFactory), kapi.Codecs.UniversalDecoder()).
 		ContinueOnError().
 		NamespaceParam(n.DefaultNamespace).
 		SelectorParam(n.Selector).
@@ -120,10 +123,13 @@ func (n *NodeOptions) GetNodes() ([]*kapi.Node, error) {
 
 	errList := []error{}
 	nodeList := []*kapi.Node{}
-	_ = r.Visit(func(info *resource.Info) error {
+	_ = r.Visit(func(info *resource.Info, err error) error {
+		if err != nil {
+			return err
+		}
 		node, ok := info.Object.(*kapi.Node)
 		if !ok {
-			err := fmt.Errorf("cannot convert input to Node: %v", reflect.TypeOf(info.Object))
+			err = fmt.Errorf("cannot convert input to Node: %v", reflect.TypeOf(info.Object))
 			errList = append(errList, err)
 			// Don't bail out if one node fails
 			return nil
@@ -138,8 +144,8 @@ func (n *NodeOptions) GetNodes() ([]*kapi.Node, error) {
 	if len(nodeList) == 0 {
 		return nodeList, fmt.Errorf("No nodes found")
 	} else {
-		givenNodeNames := util.NewStringSet(n.NodeNames...)
-		foundNodeNames := util.StringSet{}
+		givenNodeNames := sets.NewString(n.NodeNames...)
+		foundNodeNames := sets.String{}
 		for _, node := range nodeList {
 			foundNodeNames.Insert(node.ObjectMeta.Name)
 		}
@@ -151,37 +157,29 @@ func (n *NodeOptions) GetNodes() ([]*kapi.Node, error) {
 	return nodeList, nil
 }
 
-func (n *NodeOptions) GetPrintersByObject(obj runtime.Object) (kubectl.ResourcePrinter, kubectl.ResourcePrinter, error) {
-	version, kind, err := kapi.Scheme.ObjectVersionAndKind(obj)
+func (n *NodeOptions) GetPrintersByObject(obj runtime.Object) (kubectl.ResourcePrinter, error) {
+	gvk, _, err := kapi.Scheme.ObjectKinds(obj)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return n.GetPrinters(kind, version)
+	return n.GetPrinters(gvk[0])
 }
 
-func (n *NodeOptions) GetPrintersByResource(resource string) (kubectl.ResourcePrinter, kubectl.ResourcePrinter, error) {
-	version, kind, err := n.Mapper.VersionAndKindForResource(resource)
+func (n *NodeOptions) GetPrintersByResource(resource unversioned.GroupVersionResource) (kubectl.ResourcePrinter, error) {
+	gvks, err := n.Mapper.KindsFor(resource)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return n.GetPrinters(kind, version)
+	return n.GetPrinters(gvks[0])
 }
 
-func (n *NodeOptions) GetPrinters(kind, version string) (kubectl.ResourcePrinter, kubectl.ResourcePrinter, error) {
-	mapping, err := n.Mapper.RESTMapping(kind, version)
+func (n *NodeOptions) GetPrinters(gvk unversioned.GroupVersionKind) (kubectl.ResourcePrinter, error) {
+	mapping, err := n.Mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	printerWithHeaders, err := n.Printer(mapping, false, false, false, []string{})
-	if err != nil {
-		return nil, nil, err
-	}
-	printerNoHeaders, err := n.Printer(mapping, true, false, false, []string{})
-	if err != nil {
-		return nil, nil, err
-	}
-	return printerWithHeaders, printerNoHeaders, nil
+	return n.Printer(mapping, kubectl.PrintOptions{})
 }
 
 func GetPodHostFieldLabel(apiVersion string) string {

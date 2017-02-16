@@ -5,14 +5,16 @@ import (
 	"runtime/debug"
 
 	"k8s.io/kubernetes/pkg/auth/user"
-	"k8s.io/kubernetes/pkg/util"
+	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
+	"k8s.io/kubernetes/pkg/util/sets"
 
-	"github.com/go-ldap/ldap"
 	"github.com/golang/glog"
+	"gopkg.in/ldap.v2"
 
 	authapi "github.com/openshift/origin/pkg/auth/api"
 	"github.com/openshift/origin/pkg/auth/authenticator"
 	"github.com/openshift/origin/pkg/auth/ldaputil"
+	"github.com/openshift/origin/pkg/auth/ldaputil/ldapclient"
 )
 
 // Options contains configuration for an Authenticator instance
@@ -20,12 +22,7 @@ type Options struct {
 	// URL is a parsed RFC 2255 URL
 	URL ldaputil.LDAPURL
 	// ClientConfig holds information about connecting with the LDAP server
-	ClientConfig ldaputil.LDAPClientConfig
-
-	// BindDN is the optional username to bind to for the search phase. If specified, BindPassword must also be set.
-	BindDN string
-	// BindPassword is the optional password to bind to for the search phase.
-	BindPassword string
+	ClientConfig ldapclient.Config
 
 	// UserAttributeDefiner defines the values corresponding to OpenShift Identities in LDAP entries
 	// by using a deterministic mapping of LDAP entry attributes to OpenShift Identity fields. The first
@@ -67,10 +64,11 @@ func (a *Authenticator) AuthenticatePassword(username, password string) (user.In
 	}
 
 	user, err := a.mapper.UserFor(identity)
-	glog.V(4).Infof("Got userIdentityMapping: %#v", user)
 	if err != nil {
-		return nil, false, fmt.Errorf("Error creating or updating mapping for: %#v due to %v", identity, err)
+		glog.V(4).Infof("Error creating or updating mapping for: %#v due to %v", identity, err)
+		return nil, false, err
 	}
+	glog.V(4).Infof("Got userIdentityMapping: %#v", user)
 
 	return user, true, nil
 
@@ -80,7 +78,7 @@ func (a *Authenticator) AuthenticatePassword(username, password string) (user.In
 func (a *Authenticator) getIdentity(username, password string) (authapi.UserIdentityInfo, bool, error) {
 	defer func() {
 		if e := recover(); e != nil {
-			util.HandleError(fmt.Errorf("Recovered panic: %v, %s", e, debug.Stack()))
+			utilruntime.HandleError(fmt.Errorf("Recovered panic: %v, %s", e, debug.Stack()))
 		}
 	}()
 
@@ -88,16 +86,18 @@ func (a *Authenticator) getIdentity(username, password string) (authapi.UserIden
 		return nil, false, nil
 	}
 
-	// Make the connection
+	// Make the connection and bind to it if a bind DN and password were given
 	l, err := a.options.ClientConfig.Connect()
 	if err != nil {
 		return nil, false, err
 	}
 	defer l.Close()
 
-	// If specified, bind the username/password for search phase
-	if len(a.options.BindDN) > 0 {
-		if err := l.Bind(a.options.BindDN, a.options.BindPassword); err != nil {
+	if bindDN, bindPassword := a.options.ClientConfig.GetBindCredentials(); len(bindDN) > 0 {
+		if err := l.Bind(bindDN, bindPassword); err != nil {
+			// If the configured bindDN/bindPassword encounters errors, that blocks all logins
+			// Handle as a severe error in addition to returning an error to fail this particular login
+			utilruntime.HandleError(fmt.Errorf("error binding to %s for search phase: %v", bindDN, err))
 			return nil, false, err
 		}
 	}
@@ -110,7 +110,7 @@ func (a *Authenticator) getIdentity(username, password string) (authapi.UserIden
 	)
 
 	// Build list of attributes to retrieve
-	attrs := util.NewStringSet(a.options.URL.QueryAttribute)
+	attrs := sets.NewString(a.options.URL.QueryAttribute)
 	attrs.Insert(a.options.UserAttributeDefiner.AllAttributes().List()...)
 
 	// Search for LDAP record

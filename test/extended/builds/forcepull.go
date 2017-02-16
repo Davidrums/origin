@@ -1,187 +1,131 @@
 package builds
 
-/*
-This particular builds test suite is not part of the "default" group,  because its testing
-centers around manipulation of images tags to confirm whether the `docker pull` invocation occurs
-correctly based on `forcePull` setting in the BuildConfig, and rather than spend time creating / pulling down separate, test only,
-images for each test scenario, we reuse existing images and ensure that the tests do not run in parallel, and step on each
-others toes by tagging the same, existing images in ways which conflict.
-*/
-
 import (
 	"fmt"
+	"strings"
 
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
 
-	"time"
-
 	exutil "github.com/openshift/origin/test/extended/util"
 )
 
-var (
-	resetData map[string]string
+const (
+	buildPrefixTS = "ruby-sample-build-ts"
+	buildPrefixTD = "ruby-sample-build-td"
+	buildPrefixTC = "ruby-sample-build-tc"
 )
 
-const (
-	buildPrefix = "ruby-sample-build"
-	buildName   = buildPrefix + "-1"
-	s2iDockBldr = "docker.io/openshift/ruby-20-centos7"
-	custBldr    = "docker.io/openshift/origin-custom-docker-builder"
-)
+func scrapeLogs(bldPrefix string, oc *exutil.CLI) {
+	// kick off the app/lang build and verify the builder image accordingly
+	br, err := exutil.StartBuildAndWait(oc, bldPrefix)
+	o.ExpectWithOffset(1, err).NotTo(o.HaveOccurred())
+
+	out, err := br.Logs()
+	o.Expect(err).NotTo(o.HaveOccurred())
+	lines := strings.Split(out, "\n")
+	found := false
+	for _, line := range lines {
+		if strings.Contains(line, "Pulling image") && strings.Contains(line, "centos/ruby") {
+			fmt.Fprintf(g.GinkgoWriter, "\n\nfound pull image line %s\n\n", line)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		fmt.Fprintf(g.GinkgoWriter, "\n\n build log dump on failed test:  %s\n\n", out)
+		o.Expect(found).To(o.BeTrue())
+	}
+
+}
+
+func checkPodFlag(bldPrefix string, oc *exutil.CLI) {
+	if bldPrefix == buildPrefixTC {
+		// grant access to the custom build strategy
+		err := oc.AsAdmin().Run("adm").Args("policy", "add-cluster-role-to-user", "system:build-strategy-custom", oc.Username()).Execute()
+		o.Expect(err).NotTo(o.HaveOccurred())
+		defer func() {
+			err = oc.AsAdmin().Run("adm").Args("policy", "remove-cluster-role-from-user", "system:build-strategy-custom", oc.Username()).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+		}()
+	}
+
+	// kick off the app/lang build and verify the builder image accordingly
+	_, err := exutil.StartBuildAndWait(oc, bldPrefix)
+	o.ExpectWithOffset(1, err).NotTo(o.HaveOccurred())
+
+	out, err := oc.Run("get").Args("pods", bldPrefix+"-1-build", "-o", "jsonpath='{.spec.containers[0].imagePullPolicy}'").Output()
+	o.Expect(err).NotTo(o.HaveOccurred())
+	o.Expect(out).To(o.Equal("'Always'"))
+
+}
 
 /*
 If docker.io is not responding to requests in a timely manner, this test suite will be adversely affected.
 
-If you suspect such a situation, attempt pulling some openshift images other than ruby-20-centos7 or origin-custom-docker-builder
+If you suspect such a situation, attempt pulling some openshift images other than ruby-22-centos7
 while this test is running and compare results.  Restarting your docker daemon, assuming you can ping docker.io quickly, could
 be a quick fix.
 */
 
-var _ = g.BeforeSuite(func() {
-	// do a pull initially just to insure have the latest version
-	exutil.PullImage(s2iDockBldr)
-	exutil.PullImage(custBldr)
-	// save hex image IDs for image reset after corruption
-	tags := []string{s2iDockBldr + ":latest", custBldr + ":latest"}
-	hexIDs, ierr := exutil.GetImageIDForTags(tags)
-	o.Expect(ierr).NotTo(o.HaveOccurred())
-	for _, hexID := range hexIDs {
-		g.By(fmt.Sprintf("\n%s FORCE PULL TEST:  hex id %s ", time.Now().Format(time.RFC850), hexID))
-	}
-	o.Expect(len(hexIDs)).To(o.Equal(2))
-	resetData = map[string]string{s2iDockBldr: hexIDs[0], custBldr: hexIDs[1]}
-	g.By(fmt.Sprintf("\n%s FORCE PULL TEST:  hex id for s2i/docker %s and for custom %s ", time.Now().Format(time.RFC850), hexIDs[0], hexIDs[1]))
-})
-
-var _ = g.Describe("forcepull: ForcePull from OpenShift induced builds (vs. sti)", func() {
+var _ = g.Describe("[builds] forcePull should affect pulling builder images", func() {
 	defer g.GinkgoRecover()
-	var oc = exutil.NewCLI("force-pull-s2i", exutil.KubeConfigPath())
+	var oc = exutil.NewCLI("forcepull", exutil.KubeConfigPath())
 
-	g.JustBeforeEach(func() {
-		g.By("waiting for builder service account")
-		err := exutil.WaitForBuilderAccount(oc.KubeREST().ServiceAccounts(oc.Namespace()))
+	g.BeforeEach(func() {
+
+		// grant access to the custom build strategy
+		g.By("granting system:build-strategy-custom")
+		err := oc.AsAdmin().Run("adm").Args("policy", "add-cluster-role-to-user", "system:build-strategy-custom", oc.Username()).Execute()
 		o.Expect(err).NotTo(o.HaveOccurred())
+
+		defer func() {
+			err = oc.AsAdmin().Run("adm").Args("policy", "remove-cluster-role-from-user", "system:build-strategy-custom", oc.Username()).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+		}()
+
+		g.By("create application build configs for 3 strategies")
+		apps := exutil.FixturePath("testdata", "forcepull-test.json")
+		err = exutil.CreateResource(apps, oc)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
 	})
 
-	g.Describe("\n FORCE PULL TEST:  Force pull and s2i builder", func() {
-		// corrupt the s2i builder image
-		g.BeforeEach(func() {
-			exutil.CorruptImage(s2iDockBldr, custBldr, "s21")
-		})
-
-		g.AfterEach(func() {
-			exutil.ResetImage(resetData)
-		})
+	g.Context("ForcePull test context  ", func() {
 
 		g.JustBeforeEach(func() {
 			g.By("waiting for builder service account")
-			err := exutil.WaitForBuilderAccount(oc.KubeREST().ServiceAccounts(oc.Namespace()))
+			err := exutil.WaitForBuilderAccount(oc.AdminKubeClient().Core().ServiceAccounts(oc.Namespace()))
 			o.Expect(err).NotTo(o.HaveOccurred())
 		})
 
-		g.Context("\n FORCE PULL TEST:  when s2i force pull is false and the image is bad", func() {
+		g.It("ForcePull test case execution s2i", func() {
 
-			g.It("\n FORCE PULL TEST s2i false", func() {
-				fpFalseS2I := exutil.FixturePath("fixtures", "forcepull-false-s2i.json")
-				g.By(fmt.Sprintf("\n%s FORCE PULL TEST s2i false:  calling create on %s", time.Now().Format(time.RFC850), fpFalseS2I))
-				exutil.StartBuild(fpFalseS2I, buildPrefix, oc)
+			g.By("when s2i force pull is true")
+			// run twice to ensure the builder image gets pulled even if it already exists on the node
+			scrapeLogs(buildPrefixTS, oc)
+			scrapeLogs(buildPrefixTS, oc)
 
-				exutil.WaitForBuild("FORCE PULL TEST s2i false:  ", buildName, oc)
-
-				exutil.VerifyImagesSame(s2iDockBldr, custBldr, "FORCE PULL TEST s2i false:  ")
-
-			})
 		})
 
-		g.Context("\n FORCE PULL TEST:  when s2i force pull is true and the image is bad", func() {
-			g.It("\n FORCE PULL TEST s2i true", func() {
-				fpTrueS2I := exutil.FixturePath("fixtures", "forcepull-true-s2i.json")
-				g.By(fmt.Sprintf("\n%s FORCE PULL TEST s2i true:  calling create on %s", time.Now().Format(time.RFC850), fpTrueS2I))
-				exutil.StartBuild(fpTrueS2I, buildPrefix, oc)
+		g.It("ForcePull test case execution docker", func() {
 
-				exutil.WaitForBuild("FORCE PULL TEST s2i true: ", buildName, oc)
+			g.By("docker when force pull is true")
+			// run twice to ensure the builder image gets pulled even if it already exists on the node
+			scrapeLogs(buildPrefixTD, oc)
+			scrapeLogs(buildPrefixTD, oc)
 
-				exutil.VerifyImagesDifferent(s2iDockBldr, custBldr, "FORCE PULL TEST s2i true:  ")
-			})
-		})
-	})
-
-	g.Describe("\n FORCE PULL TEST:  Force pull and docker builder", func() {
-		// corrupt the docker builder image
-		g.BeforeEach(func() {
-			exutil.CorruptImage(s2iDockBldr, custBldr, "docker")
 		})
 
-		g.AfterEach(func() {
-			exutil.ResetImage(resetData)
-		})
+		g.It("ForcePull test case execution custom", func() {
 
-		g.Context("\n FORCE PULL TEST:  when docker force pull is false and the image is bad", func() {
-			g.It("\n FORCE PULL TEST dock false", func() {
-				fpFalseDock := exutil.FixturePath("fixtures", "forcepull-false-dock.json")
-				g.By(fmt.Sprintf("\n%s FORCE PULL TEST dock false:  calling create on %s", time.Now().Format(time.RFC850), fpFalseDock))
-				exutil.StartBuild(fpFalseDock, buildPrefix, oc)
+			g.By("when custom force pull is true")
 
-				exutil.WaitForBuild("FORCE PULL TEST dock false", buildName, oc)
+			checkPodFlag(buildPrefixTC, oc)
 
-				exutil.VerifyImagesSame(s2iDockBldr, custBldr, "FORCE PULL TEST docker false:  ")
-
-			})
-		})
-
-		g.Context("\n FORCE PULL TEST:  docker when force pull is true and the image is bad", func() {
-			g.It("\n FORCE PULL TEST dock true", func() {
-				fpTrueDock := exutil.FixturePath("fixtures", "forcepull-true-dock.json")
-				g.By(fmt.Sprintf("\n%s FORCE PULL TEST dock true:  calling create on %s", time.Now().Format(time.RFC850), fpTrueDock))
-				exutil.StartBuild(fpTrueDock, buildPrefix, oc)
-
-				exutil.WaitForBuild("FORCE PULL TEST dock true", buildName, oc)
-
-				exutil.VerifyImagesDifferent(s2iDockBldr, custBldr, "FORCE PULL TEST docker true:  ")
-
-			})
-		})
-	})
-
-	g.Describe("\n FORCE PULL TEST:  Force pull and custom builder", func() {
-		// corrupt the custom builder image
-		g.BeforeEach(func() {
-			exutil.CorruptImage(custBldr, s2iDockBldr, "custom")
-		})
-
-		g.AfterEach(func() {
-			exutil.ResetImage(resetData)
-		})
-
-		g.Context("\n FORCE PULL TEST:  when custom force pull is false and the image is bad", func() {
-			g.It("\nFORCE PULL TEST cust false", func() {
-				fpFalseCust := exutil.FixturePath("fixtures", "forcepull-false-cust.json")
-				g.By(fmt.Sprintf("\n%s FORCE PULL TEST cust false:  calling create on %s", time.Now().Format(time.RFC850), fpFalseCust))
-				exutil.StartBuild(fpFalseCust, buildPrefix, oc)
-
-				g.By("\nFORCE PULL TEST cust false:  expecting the image is not refreshed")
-
-				exutil.WaitForBuild("FORCE PULL TEST cust false", buildName, oc)
-
-				exutil.VerifyImagesSame(s2iDockBldr, custBldr, "FORCE PULL TEST custom false:  ")
-			})
-		})
-
-		g.Context("\n FORCE PULL TEST:  when custom force pull is true and the image is bad", func() {
-			g.It("\n FORCE PULL TEST cust true", func() {
-				fpTrueCust := exutil.FixturePath("fixtures", "forcepull-true-cust.json")
-				g.By(fmt.Sprintf("\n%s FORCE PULL TEST cust true:  calling create on %s", time.Now().Format(time.RFC850), fpTrueCust))
-				exutil.StartBuild(fpTrueCust, buildPrefix, oc)
-
-				g.By("\n FORCE PULL TEST cust true:  expecting the image is refreshed")
-
-				exutil.WaitForBuild("FORCE PULL TEST cust true", buildName, oc)
-
-				exutil.VerifyImagesDifferent(s2iDockBldr, custBldr, "FORCE PULL TEST custom true:  ")
-
-			})
 		})
 
 	})
+
 })

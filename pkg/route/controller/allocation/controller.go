@@ -17,7 +17,7 @@ type RouteAllocationController struct {
 func (c *RouteAllocationController) AllocateRouterShard(route *routeapi.Route) (*routeapi.RouterShard, error) {
 
 	glog.V(4).Infof("Allocating router shard for Route: %s [alias=%s]",
-		route.ServiceName, route.Host)
+		route.Name, route.Spec.Host)
 
 	shard, err := c.Plugin.Allocate(route)
 
@@ -27,20 +27,19 @@ func (c *RouteAllocationController) AllocateRouterShard(route *routeapi.Route) (
 	}
 
 	glog.V(4).Infof("Route %s allocated to shard %s [suffix=%s]",
-		route.ServiceName, shard.ShardName, shard.DNSSuffix)
+		route.Name, shard.ShardName, shard.DNSSuffix)
 
 	return shard, err
 }
 
 // GenerateHostname generates a host name for the given route and router shard combination.
 func (c *RouteAllocationController) GenerateHostname(route *routeapi.Route, shard *routeapi.RouterShard) string {
-	glog.V(4).Infof("Generating host name for Route: %s",
-		route.ServiceName)
+	glog.V(4).Infof("Generating host name for Route: %s", route.Name)
 
 	s := c.Plugin.GenerateHostname(route, shard)
 
 	glog.V(4).Infof("Route: %s, generated host name/alias=%s",
-		route.ServiceName, s)
+		route.Name, s)
 
 	return s
 }

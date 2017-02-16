@@ -12,7 +12,7 @@ import (
 
 	"github.com/RangelReale/osincli"
 	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/sets"
 
 	authapi "github.com/openshift/origin/pkg/auth/api"
 	"github.com/openshift/origin/pkg/auth/oauth/external"
@@ -96,7 +96,7 @@ func NewProvider(providerName string, transport http.RoundTripper, config Config
 		}
 	}
 
-	if !util.NewStringSet(config.Scopes...).Has("openid") {
+	if !sets.NewString(config.Scopes...).Has("openid") {
 		return nil, errors.New("Scopes must include openid")
 	}
 
@@ -193,9 +193,11 @@ func (p provider) GetUserIdentity(data *osincli.AccessData) (authapi.UserIdentit
 		}
 	}
 
+	glog.V(5).Infof("openid claims: %#v", claims)
+
 	id, _ := getClaimValue(claims, p.IDClaims)
 	if id == "" {
-		return nil, false, fmt.Errorf("Could not retrieve id claim for %#v", p.IDClaims)
+		return nil, false, fmt.Errorf("Could not retrieve id claim for %#v from %#v", p.IDClaims, claims)
 	}
 	identity := authapi.NewDefaultUserIdentityInfo(p.providerName, id)
 

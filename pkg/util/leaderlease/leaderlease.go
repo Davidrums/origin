@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"time"
 
-	etcdclient "github.com/coreos/go-etcd/etcd"
+	etcdclient "github.com/coreos/etcd/client"
 	"github.com/golang/glog"
-	storage "k8s.io/kubernetes/pkg/storage/etcd"
-	"k8s.io/kubernetes/pkg/util"
+	"golang.org/x/net/context"
+
+	etcdutil "k8s.io/kubernetes/pkg/storage/etcd/util"
+	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 	"k8s.io/kubernetes/pkg/util/wait"
+	utilwait "k8s.io/kubernetes/pkg/util/wait"
 )
 
 // Leaser allows a caller to acquire a lease and be notified when it is lost.
@@ -18,7 +21,7 @@ type Leaser interface {
 	// lease is acquired, and the provided channel will be closed when the lease is lost. If the
 	// function returns true, the lease will be released on exit. If the function returns false,
 	// the lease will be held.
-	AcquireAndHold(chan struct{})
+	AcquireAndHold(chan error)
 	// Release returns any active leases
 	Release()
 }
@@ -26,7 +29,7 @@ type Leaser interface {
 // Etcd takes and holds a leader lease until it can no longer confirm it owns
 // the lease, then returns.
 type Etcd struct {
-	client *etcdclient.Client
+	client etcdclient.KeysAPI
 	key    string
 	value  string
 	ttl    uint64
@@ -46,14 +49,14 @@ type Etcd struct {
 // NewEtcd creates a Lease in etcd, storing value at key with expiration ttl
 // and continues to refresh it until the key is lost, expires, or another
 // client takes it.
-func NewEtcd(client *etcdclient.Client, key, value string, ttl uint64) Leaser {
+func NewEtcd(client etcdclient.Client, key, value string, ttl uint64) Leaser {
 	return &Etcd{
-		client: client,
+		client: etcdclient.NewKeysAPI(client),
 		key:    key,
 		value:  value,
 		ttl:    ttl,
 
-		waitFraction:         0.75,
+		waitFraction:         0.66,
 		pauseInterval:        time.Second,
 		maxRetries:           10,
 		minimumRetryInterval: 100 * time.Millisecond,
@@ -61,11 +64,11 @@ func NewEtcd(client *etcdclient.Client, key, value string, ttl uint64) Leaser {
 }
 
 // AcquireAndHold implements an acquire and release of a lease.
-func (e *Etcd) AcquireAndHold(notify chan struct{}) {
+func (e *Etcd) AcquireAndHold(notify chan error) {
 	for {
 		ok, ttl, index, err := e.tryAcquire()
 		if err != nil {
-			util.HandleError(err)
+			utilruntime.HandleError(err)
 			time.Sleep(e.pauseInterval)
 			continue
 		}
@@ -75,12 +78,12 @@ func (e *Etcd) AcquireAndHold(notify chan struct{}) {
 		}
 
 		// notify
-		notify <- struct{}{}
+		notify <- nil
 		defer close(notify)
 
 		// hold the lease
 		if err := e.tryHold(ttl, index); err != nil {
-			util.HandleError(err)
+			notify <- err
 		}
 		break
 	}
@@ -93,19 +96,27 @@ func (e *Etcd) AcquireAndHold(notify chan struct{}) {
 func (e *Etcd) tryAcquire() (ok bool, ttl uint64, nextIndex uint64, err error) {
 	ttl = e.ttl
 
-	resp, err := e.client.Create(e.key, e.value, ttl)
+	resp, err := e.client.Set(
+		context.Background(),
+		e.key,
+		e.value,
+		&etcdclient.SetOptions{
+			TTL:       time.Duration(ttl) * time.Second,
+			PrevExist: etcdclient.PrevNoExist,
+		},
+	)
 	if err == nil {
 		// we hold the lease
-		index := resp.EtcdIndex
+		index := resp.Index
 		glog.V(4).Infof("Lease %s acquired at %d, ttl %d seconds", e.key, index, e.ttl)
 		return true, ttl, index + 1, nil
 	}
 
-	if !storage.IsEtcdNodeExist(err) {
+	if !etcdutil.IsEtcdNodeExist(err) {
 		return false, 0, 0, fmt.Errorf("unable to check lease %s: %v", e.key, err)
 	}
 
-	latest, err := e.client.Get(e.key, false, false)
+	latest, err := e.client.Get(context.Background(), e.key, nil)
 	if err != nil {
 		return false, 0, 0, fmt.Errorf("unable to retrieve lease %s: %v", e.key, err)
 	}
@@ -133,16 +144,16 @@ func (e *Etcd) tryAcquire() (ok bool, ttl uint64, nextIndex uint64, err error) {
 // Release tries to delete the leader lock.
 func (e *Etcd) Release() {
 	for i := 0; i < e.maxRetries; i++ {
-		_, err := e.client.CompareAndDelete(e.key, e.value, 0)
+		_, err := e.client.Delete(context.Background(), e.key, &etcdclient.DeleteOptions{PrevValue: e.value})
 		if err == nil {
 			break
 		}
 		// If the value has changed, we don't hold the lease. If the key is missing we don't
 		// hold the lease.
-		if storage.IsEtcdTestFailed(err) || storage.IsEtcdNotFound(err) {
+		if etcdutil.IsEtcdTestFailed(err) || etcdutil.IsEtcdNotFound(err) {
 			break
 		}
-		util.HandleError(fmt.Errorf("unable to release %s: %v", e.key, err))
+		utilruntime.HandleError(fmt.Errorf("unable to release %s: %v", e.key, err))
 	}
 }
 
@@ -150,21 +161,25 @@ func (e *Etcd) Release() {
 // If the lease hold fails, is deleted, or changed to another user. The provided
 // index is used to watch from.
 // TODO: currently if we miss the watch window, we will error and try to recreate
-//   the lock. It's likely we will lose the lease due to that.
+// the lock. It's likely we will lose the lease due to that.
 func (e *Etcd) tryHold(ttl, index uint64) error {
 	// watch for termination
 	stop := make(chan struct{})
 	lost := make(chan struct{})
+	closedLost := false
 	watchIndex := index
-	go util.Until(func() {
+	go utilwait.Until(func() {
 		index, err := e.waitForExpiration(true, watchIndex, stop)
 		watchIndex = index
 		if err != nil {
-			util.HandleError(fmt.Errorf("error watching for lease expiration %s: %v", e.key, err))
+			utilruntime.HandleError(fmt.Errorf("error watching for lease expiration %s: %v", e.key, err))
 			return
 		}
 		glog.V(4).Infof("Lease %s lost due to deletion at %d", e.key, watchIndex)
-		close(lost)
+		if !closedLost {
+			closedLost = true
+			close(lost)
+		}
 	}, 100*time.Millisecond, stop)
 	defer close(stop)
 
@@ -182,17 +197,23 @@ func (e *Etcd) tryHold(ttl, index uint64) error {
 		case <-time.After(after):
 			err := wait.Poll(interval, last, func() (bool, error) {
 				glog.V(4).Infof("Renewing lease %s at %d", e.key, index-1)
-				resp, err := e.client.CompareAndSwap(e.key, e.value, e.ttl, e.value, index-1)
+				resp, err := e.client.Set(context.Background(), e.key, e.value,
+					&etcdclient.SetOptions{
+						TTL:       time.Duration(e.ttl) * time.Second,
+						PrevValue: e.value,
+						PrevIndex: index - 1,
+					},
+				)
 				switch {
 				case err == nil:
 					index = eventIndexFor(resp)
 					return true, nil
-				case storage.IsEtcdTestFailed(err):
+				case etcdutil.IsEtcdTestFailed(err):
 					return false, fmt.Errorf("another client has taken the lease %s: %v", e.key, err)
-				case storage.IsEtcdNotFound(err):
+				case etcdutil.IsEtcdNotFound(err):
 					return false, fmt.Errorf("another client has revoked the lease %s", e.key)
 				default:
-					util.HandleError(fmt.Errorf("unexpected error renewing lease %s: %v", e.key, err))
+					utilruntime.HandleError(fmt.Errorf("unexpected error renewing lease %s: %v", e.key, err))
 					index = etcdIndexFor(err, index)
 					// try again
 					return false, nil
@@ -243,7 +264,8 @@ func (e *Etcd) waitExpiration(held bool, from uint64, stop chan struct{}) (bool,
 		default:
 		}
 		glog.V(5).Infof("watching for expiration of lease %s from %d", e.key, from)
-		resp, err := e.client.Watch(e.key, from, false, nil, nil)
+		w := e.client.Watcher(e.key, &etcdclient.WatcherOptions{AfterIndex: from - 1})
+		resp, err := w.Next(context.Background())
 		if err != nil {
 			return false, etcdIndexFor(err, from), err
 		}
@@ -277,13 +299,13 @@ func eventIndexFor(resp *etcdclient.Response) uint64 {
 	if resp.PrevNode != nil {
 		return resp.PrevNode.ModifiedIndex + 1
 	}
-	return resp.EtcdIndex
+	return resp.Index
 }
 
 // etcdIndexFor returns index, or if err is an EtcdError, the current
 // etcd index.
 func etcdIndexFor(err error, index uint64) uint64 {
-	if etcderr, ok := err.(*etcdclient.EtcdError); ok {
+	if etcderr, ok := err.(*etcdclient.Error); ok {
 		return etcderr.Index
 	}
 	return index

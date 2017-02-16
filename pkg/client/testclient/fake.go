@@ -1,87 +1,129 @@
 package testclient
 
 import (
+	"fmt"
 	"sync"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	ktestclient "k8s.io/kubernetes/pkg/client/testclient"
+	"k8s.io/kubernetes/pkg/apimachinery/registered"
+	"k8s.io/kubernetes/pkg/client/testing/core"
 	"k8s.io/kubernetes/pkg/runtime"
 	"k8s.io/kubernetes/pkg/watch"
 
-	"github.com/openshift/origin/pkg/api/latest"
+	_ "github.com/openshift/origin/pkg/api/install"
 	"github.com/openshift/origin/pkg/client"
 )
 
 // Fake implements Interface. Meant to be embedded into a struct to get a default
 // implementation. This makes faking out just the method you want to test easier.
 type Fake struct {
-	actions []ktestclient.Action // these may be castable to other types, but "Action" is the minimum
-	err     error
+	sync.RWMutex
+	actions []core.Action // these may be castable to other types, but "Action" is the minimum
 
-	Watch watch.Interface
-	// ReactFn is an optional function that will be invoked with the provided action
-	// and return a response.
-	ReactFn ktestclient.ReactionFunc
-
-	Lock sync.RWMutex
+	// ReactionChain is the list of reactors that will be attempted for every request in the order they are tried
+	ReactionChain []core.Reactor
+	// WatchReactionChain is the list of watch reactors that will be attempted for every request in the order they are tried
+	WatchReactionChain []core.WatchReactor
 }
 
 // NewSimpleFake returns a client that will respond with the provided objects
 func NewSimpleFake(objects ...runtime.Object) *Fake {
-	o := ktestclient.NewObjects(kapi.Scheme, kapi.Scheme)
+	o := core.NewObjectTracker(kapi.Scheme, kapi.Codecs.UniversalDecoder())
 	for _, obj := range objects {
 		if err := o.Add(obj); err != nil {
 			panic(err)
 		}
 	}
-	return &Fake{ReactFn: ktestclient.ObjectReaction(o, latest.RESTMapper)}
+
+	fakeClient := &Fake{}
+	fakeClient.AddReactor("*", "*", core.ObjectReaction(o, registered.RESTMapper()))
+
+	fakeClient.AddWatchReactor("*", core.DefaultWatchReactor(watch.NewFake(), nil))
+
+	return fakeClient
 }
 
-// Invokes registers the passed fake action and reacts on it if a ReactFn
-// has been defined
-func (c *Fake) Invokes(action ktestclient.Action, defaultReturnObj runtime.Object) (runtime.Object, error) {
-	c.Lock.Lock()
-	defer c.Lock.Unlock()
+// AddReactor appends a reactor to the end of the chain
+func (c *Fake) AddReactor(verb, resource string, reaction core.ReactionFunc) {
+	c.ReactionChain = append(c.ReactionChain, &core.SimpleReactor{Verb: verb, Resource: resource, Reaction: reaction})
+}
+
+// PrependReactor adds a reactor to the beginning of the chain
+func (c *Fake) PrependReactor(verb, resource string, reaction core.ReactionFunc) {
+	c.ReactionChain = append([]core.Reactor{&core.SimpleReactor{Verb: verb, Resource: resource, Reaction: reaction}}, c.ReactionChain...)
+}
+
+// AddWatchReactor appends a reactor to the end of the chain
+func (c *Fake) AddWatchReactor(resource string, reaction core.WatchReactionFunc) {
+	c.WatchReactionChain = append(c.WatchReactionChain, &core.SimpleWatchReactor{Resource: resource, Reaction: reaction})
+}
+
+// PrependWatchReactor adds a reactor to the beginning of the chain.
+func (c *Fake) PrependWatchReactor(resource string, reaction core.WatchReactionFunc) {
+	c.WatchReactionChain = append([]core.WatchReactor{&core.SimpleWatchReactor{resource, reaction}}, c.WatchReactionChain...)
+}
+
+// Invokes records the provided Action and then invokes the ReactFn (if provided).
+// defaultReturnObj is expected to be of the same type a normal call would return.
+func (c *Fake) Invokes(action core.Action, defaultReturnObj runtime.Object) (runtime.Object, error) {
+	c.Lock()
+	defer c.Unlock()
 
 	c.actions = append(c.actions, action)
-	if c.ReactFn != nil {
-		return c.ReactFn(action)
+	for _, reactor := range c.ReactionChain {
+		if !reactor.Handles(action) {
+			continue
+		}
+
+		handled, ret, err := reactor.React(action)
+		if !handled {
+			continue
+		}
+
+		return ret, err
 	}
-	return defaultReturnObj, c.err
+
+	return defaultReturnObj, nil
+}
+
+// InvokesWatch records the provided Action and then invokes the ReactFn (if provided).
+func (c *Fake) InvokesWatch(action core.Action) (watch.Interface, error) {
+	c.Lock()
+	defer c.Unlock()
+
+	c.actions = append(c.actions, action)
+	for _, reactor := range c.WatchReactionChain {
+		if !reactor.Handles(action) {
+			continue
+		}
+
+		handled, ret, err := reactor.React(action)
+		if !handled {
+			continue
+		}
+
+		return ret, err
+	}
+
+	return nil, fmt.Errorf("unhandled watch: %#v", action)
 }
 
 // ClearActions clears the history of actions called on the fake client
 func (c *Fake) ClearActions() {
-	c.Lock.Lock()
-	c.Lock.Unlock()
+	c.Lock()
+	c.Unlock()
 
-	c.actions = make([]ktestclient.Action, 0)
+	c.actions = make([]core.Action, 0)
 }
 
 // Actions returns a chronologically ordered slice fake actions called on the fake client
-func (c *Fake) Actions() []ktestclient.Action {
-	c.Lock.RLock()
-	defer c.Lock.RUnlock()
+func (c *Fake) Actions() []core.Action {
+	c.RLock()
+	defer c.RUnlock()
 
-	fa := make([]ktestclient.Action, len(c.actions))
+	fa := make([]core.Action, len(c.actions))
 	copy(fa, c.actions)
 	return fa
-}
-
-// SetErr sets the error to return for client calls
-func (c *Fake) SetErr(err error) {
-	c.Lock.Lock()
-	defer c.Lock.Unlock()
-
-	c.err = err
-}
-
-// Err returns any a client error or nil
-func (c *Fake) Err() error {
-	c.Lock.RLock()
-	c.Lock.RUnlock()
-
-	return c.err
 }
 
 var _ client.Interface = &Fake{}
@@ -104,6 +146,16 @@ func (c *Fake) BuildLogs(namespace string) client.BuildLogsInterface {
 // Images provides a fake REST client for Images
 func (c *Fake) Images() client.ImageInterface {
 	return &FakeImages{Fake: c}
+}
+
+// ImageSignatures provides a fake REST client for ImageSignatures
+func (c *Fake) ImageSignatures() client.ImageSignatureInterface {
+	return &FakeImageSignatures{Fake: c}
+}
+
+// ImageStreams provides a fake REST client for ImageStreams
+func (c *Fake) ImageStreamSecrets(namespace string) client.ImageStreamSecretInterface {
+	return &FakeImageStreamSecrets{Fake: c, Namespace: namespace}
 }
 
 // ImageStreams provides a fake REST client for ImageStreams
@@ -131,6 +183,11 @@ func (c *Fake) DeploymentConfigs(namespace string) client.DeploymentConfigInterf
 	return &FakeDeploymentConfigs{Fake: c, Namespace: namespace}
 }
 
+// DeploymentLogs provides a fake REST client for DeploymentLogs
+func (c *Fake) DeploymentLogs(namespace string) client.DeploymentLogInterface {
+	return &FakeDeploymentLogs{Fake: c, Namespace: namespace}
+}
+
 // Routes provides a fake REST client for Routes
 func (c *Fake) Routes(namespace string) client.RouteInterface {
 	return &FakeRoutes{Fake: c, Namespace: namespace}
@@ -149,6 +206,11 @@ func (c *Fake) NetNamespaces() client.NetNamespaceInterface {
 // ClusterNetwork provides a fake REST client for ClusterNetwork
 func (c *Fake) ClusterNetwork() client.ClusterNetworkInterface {
 	return &FakeClusterNetwork{Fake: c}
+}
+
+// EgressNetworkPolicies provides a fake REST client for EgressNetworkPolicies
+func (c *Fake) EgressNetworkPolicies(namespace string) client.EgressNetworkPolicyInterface {
+	return &FakeEgressNetworkPolicy{Fake: c, Namespace: namespace}
 }
 
 // Templates provides a fake REST client for Templates
@@ -211,6 +273,14 @@ func (c *Fake) PolicyBindings(namespace string) client.PolicyBindingInterface {
 	return &FakePolicyBindings{Fake: c, Namespace: namespace}
 }
 
+func (c *Fake) SelfSubjectRulesReviews(namespace string) client.SelfSubjectRulesReviewInterface {
+	return &FakeSelfSubjectRulesReviews{Fake: c, Namespace: namespace}
+}
+
+func (c *Fake) SubjectRulesReviews(namespace string) client.SubjectRulesReviewInterface {
+	return &FakeSubjectRulesReviews{Fake: c, Namespace: namespace}
+}
+
 // LocalResourceAccessReviews provides a fake REST client for ResourceAccessReviews
 func (c *Fake) LocalResourceAccessReviews(namespace string) client.LocalResourceAccessReviewInterface {
 	return &FakeLocalResourceAccessReviews{Fake: c}
@@ -231,9 +301,20 @@ func (c *Fake) ImpersonateLocalSubjectAccessReviews(namespace, token string) cli
 	return &FakeLocalSubjectAccessReviews{Fake: c, Namespace: namespace}
 }
 
-// OAuthAccessTokens provides a fake REST client for OAuthAccessTokens
+func (c *Fake) OAuthClients() client.OAuthClientInterface {
+	return &FakeOAuthClient{Fake: c}
+}
+
+func (c *Fake) OAuthClientAuthorizations() client.OAuthClientAuthorizationInterface {
+	return &FakeOAuthClientAuthorization{Fake: c}
+}
+
 func (c *Fake) OAuthAccessTokens() client.OAuthAccessTokenInterface {
 	return &FakeOAuthAccessTokens{Fake: c}
+}
+
+func (c *Fake) OAuthAuthorizeTokens() client.OAuthAuthorizeTokenInterface {
+	return &FakeOAuthAuthorizeTokens{Fake: c}
 }
 
 // LocalSubjectAccessReviews provides a fake REST client for SubjectAccessReviews
@@ -264,4 +345,16 @@ func (c *Fake) ClusterRoles() client.ClusterRoleInterface {
 // ClusterRoleBindings provides a fake REST client for ClusterRoleBindings
 func (c *Fake) ClusterRoleBindings() client.ClusterRoleBindingInterface {
 	return &FakeClusterRoleBindings{Fake: c}
+}
+
+func (c *Fake) ClusterResourceQuotas() client.ClusterResourceQuotaInterface {
+	return &FakeClusterResourceQuotas{Fake: c}
+}
+
+func (c *Fake) AppliedClusterResourceQuotas(namespace string) client.AppliedClusterResourceQuotaInterface {
+	return &FakeAppliedClusterResourceQuotas{Fake: c, Namespace: namespace}
+}
+
+func (c *Fake) RoleBindingRestrictions(namespace string) client.RoleBindingRestrictionInterface {
+	return &FakeRoleBindingRestrictions{Fake: c, Namespace: namespace}
 }

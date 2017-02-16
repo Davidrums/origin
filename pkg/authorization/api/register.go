@@ -1,11 +1,34 @@
 package api
 
 import (
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/runtime"
 )
 
-func init() {
-	api.Scheme.AddKnownTypes("",
+const GroupName = ""
+const FutureGroupName = "authorization.openshift.io"
+
+// SchemeGroupVersion is group version used to register these objects
+var SchemeGroupVersion = unversioned.GroupVersion{Group: GroupName, Version: runtime.APIVersionInternal}
+
+// Kind takes an unqualified kind and returns back a Group qualified GroupKind
+func Kind(kind string) unversioned.GroupKind {
+	return SchemeGroupVersion.WithKind(kind).GroupKind()
+}
+
+// Resource takes an unqualified resource and returns back a Group qualified GroupResource
+func Resource(resource string) unversioned.GroupResource {
+	return SchemeGroupVersion.WithResource(resource).GroupResource()
+}
+
+var (
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
+	AddToScheme   = SchemeBuilder.AddToScheme
+)
+
+// Adds the list of known types to api.Scheme.
+func addKnownTypes(scheme *runtime.Scheme) error {
+	scheme.AddKnownTypes(SchemeGroupVersion,
 		&Role{},
 		&RoleBinding{},
 		&Policy{},
@@ -15,6 +38,8 @@ func init() {
 		&RoleBindingList{},
 		&RoleList{},
 
+		&SelfSubjectRulesReview{},
+		&SubjectRulesReview{},
 		&ResourceAccessReview{},
 		&SubjectAccessReview{},
 		&LocalResourceAccessReview{},
@@ -31,31 +56,9 @@ func init() {
 		&ClusterPolicyBindingList{},
 		&ClusterRoleBindingList{},
 		&ClusterRoleList{},
+
+		&RoleBindingRestriction{},
+		&RoleBindingRestrictionList{},
 	)
+	return nil
 }
-
-func (*ClusterRole) IsAnAPIObject()              {}
-func (*ClusterPolicy) IsAnAPIObject()            {}
-func (*ClusterPolicyBinding) IsAnAPIObject()     {}
-func (*ClusterRoleBinding) IsAnAPIObject()       {}
-func (*ClusterPolicyList) IsAnAPIObject()        {}
-func (*ClusterPolicyBindingList) IsAnAPIObject() {}
-func (*ClusterRoleBindingList) IsAnAPIObject()   {}
-func (*ClusterRoleList) IsAnAPIObject()          {}
-
-func (*Role) IsAnAPIObject()              {}
-func (*Policy) IsAnAPIObject()            {}
-func (*PolicyBinding) IsAnAPIObject()     {}
-func (*RoleBinding) IsAnAPIObject()       {}
-func (*PolicyList) IsAnAPIObject()        {}
-func (*PolicyBindingList) IsAnAPIObject() {}
-func (*RoleBindingList) IsAnAPIObject()   {}
-func (*RoleList) IsAnAPIObject()          {}
-
-func (*ResourceAccessReview) IsAnAPIObject()          {}
-func (*SubjectAccessReview) IsAnAPIObject()           {}
-func (*LocalResourceAccessReview) IsAnAPIObject()     {}
-func (*LocalSubjectAccessReview) IsAnAPIObject()      {}
-func (*ResourceAccessReviewResponse) IsAnAPIObject()  {}
-func (*SubjectAccessReviewResponse) IsAnAPIObject()   {}
-func (*IsPersonalSubjectAccessReview) IsAnAPIObject() {}

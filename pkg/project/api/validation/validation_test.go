@@ -4,8 +4,9 @@ import (
 	"testing"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/util/fielderrors"
+	"k8s.io/kubernetes/pkg/util/validation/field"
 
+	oapi "github.com/openshift/origin/pkg/api"
 	"github.com/openshift/origin/pkg/project/api"
 )
 
@@ -20,8 +21,8 @@ func TestValidateProject(t *testing.T) {
 			project: api.Project{
 				ObjectMeta: kapi.ObjectMeta{
 					Annotations: map[string]string{
-						api.ProjectDescription: "This is a description",
-						api.ProjectDisplayName: "hi",
+						oapi.OpenShiftDescription: "This is a description",
+						oapi.OpenShiftDisplayName: "hi",
 					},
 				},
 			},
@@ -34,8 +35,8 @@ func TestValidateProject(t *testing.T) {
 				ObjectMeta: kapi.ObjectMeta{
 					Name: "141-.124.$",
 					Annotations: map[string]string{
-						api.ProjectDescription: "This is a description",
-						api.ProjectDisplayName: "hi",
+						oapi.OpenShiftDescription: "This is a description",
+						oapi.OpenShiftDisplayName: "hi",
 					},
 				},
 			},
@@ -94,8 +95,8 @@ func TestValidateProject(t *testing.T) {
 					Name:      "foo",
 					Namespace: "foo",
 					Annotations: map[string]string{
-						api.ProjectDescription: "This is a description",
-						api.ProjectDisplayName: "hi",
+						oapi.OpenShiftDescription: "This is a description",
+						oapi.OpenShiftDisplayName: "hi",
 					},
 				},
 			},
@@ -109,8 +110,8 @@ func TestValidateProject(t *testing.T) {
 					Name:      "foo",
 					Namespace: "",
 					Annotations: map[string]string{
-						api.ProjectDescription: "This is a description",
-						api.ProjectDisplayName: "h\t\ni",
+						oapi.OpenShiftDescription: "This is a description",
+						oapi.OpenShiftDisplayName: "h\t\ni",
 					},
 				},
 			},
@@ -157,8 +158,8 @@ func TestValidateProject(t *testing.T) {
 		ObjectMeta: kapi.ObjectMeta{
 			Name: "foo",
 			Annotations: map[string]string{
-				api.ProjectDescription: "This is a description",
-				api.ProjectDisplayName: "hi",
+				oapi.OpenShiftDescription: "This is a description",
+				oapi.OpenShiftDisplayName: "hi",
 			},
 		},
 	}
@@ -176,9 +177,9 @@ func TestValidateProjectUpdate(t *testing.T) {
 			Name:            "project-name",
 			ResourceVersion: "1",
 			Annotations: map[string]string{
-				api.ProjectDescription:  "This is a description",
-				api.ProjectDisplayName:  "display name",
-				api.ProjectNodeSelector: "infra=true, env = test",
+				oapi.OpenShiftDescription: "This is a description",
+				oapi.OpenShiftDisplayName: "display name",
+				api.ProjectNodeSelector:   "infra=true, env = test",
 			},
 			Labels: map[string]string{"label-name": "value"},
 		},
@@ -188,9 +189,9 @@ func TestValidateProjectUpdate(t *testing.T) {
 			Name:            "project-name",
 			ResourceVersion: "1",
 			Annotations: map[string]string{
-				api.ProjectDescription:  "This is a description",
-				api.ProjectDisplayName:  "display name change",
-				api.ProjectNodeSelector: "infra=true, env = test",
+				oapi.OpenShiftDescription: "This is a description",
+				oapi.OpenShiftDisplayName: "display name change",
+				api.ProjectNodeSelector:   "infra=true, env = test",
 			},
 			Labels: map[string]string{"label-name": "value"},
 		},
@@ -203,7 +204,7 @@ func TestValidateProjectUpdate(t *testing.T) {
 
 	errorCases := map[string]struct {
 		A api.Project
-		T fielderrors.ValidationErrorType
+		T field.ErrorType
 		F string
 	}{
 		"change name": {
@@ -215,7 +216,7 @@ func TestValidateProjectUpdate(t *testing.T) {
 					Labels:          project.Labels,
 				},
 			},
-			T: fielderrors.ValidationErrorTypeInvalid,
+			T: field.ErrorTypeInvalid,
 			F: "metadata.name",
 		},
 		"invalid displayname": {
@@ -224,15 +225,15 @@ func TestValidateProjectUpdate(t *testing.T) {
 					Name:            "project-name",
 					ResourceVersion: "1",
 					Annotations: map[string]string{
-						api.ProjectDescription:  "This is a description",
-						api.ProjectDisplayName:  "display name\n",
-						api.ProjectNodeSelector: "infra=true, env = test",
+						oapi.OpenShiftDescription: "This is a description",
+						oapi.OpenShiftDisplayName: "display name\n",
+						api.ProjectNodeSelector:   "infra=true, env = test",
 					},
 					Labels: project.Labels,
 				},
 			},
-			T: fielderrors.ValidationErrorTypeInvalid,
-			F: "metadata.annotations[" + api.ProjectDisplayName + "]",
+			T: field.ErrorTypeInvalid,
+			F: "metadata.annotations[" + oapi.OpenShiftDisplayName + "]",
 		},
 		"updating disallowed annotation": {
 			A: api.Project{
@@ -240,14 +241,14 @@ func TestValidateProjectUpdate(t *testing.T) {
 					Name:            "project-name",
 					ResourceVersion: "1",
 					Annotations: map[string]string{
-						api.ProjectDescription:  "This is a description",
-						api.ProjectDisplayName:  "display name",
-						api.ProjectNodeSelector: "infra=true, env = test2",
+						oapi.OpenShiftDescription: "This is a description",
+						oapi.OpenShiftDisplayName: "display name",
+						api.ProjectNodeSelector:   "infra=true, env = test2",
 					},
 					Labels: project.Labels,
 				},
 			},
-			T: fielderrors.ValidationErrorTypeInvalid,
+			T: field.ErrorTypeInvalid,
 			F: "metadata.annotations[openshift.io/node-selector]",
 		},
 		"delete annotation": {
@@ -256,13 +257,13 @@ func TestValidateProjectUpdate(t *testing.T) {
 					Name:            "project-name",
 					ResourceVersion: "1",
 					Annotations: map[string]string{
-						api.ProjectDescription: "This is a description",
-						api.ProjectDisplayName: "display name",
+						oapi.OpenShiftDescription: "This is a description",
+						oapi.OpenShiftDisplayName: "display name",
 					},
 					Labels: project.Labels,
 				},
 			},
-			T: fielderrors.ValidationErrorTypeInvalid,
+			T: field.ErrorTypeInvalid,
 			F: "metadata.annotations[openshift.io/node-selector]",
 		},
 		"updating label": {
@@ -274,7 +275,7 @@ func TestValidateProjectUpdate(t *testing.T) {
 					Labels:          map[string]string{"label-name": "diff"},
 				},
 			},
-			T: fielderrors.ValidationErrorTypeInvalid,
+			T: field.ErrorTypeInvalid,
 			F: "metadata.labels[label-name]",
 		},
 		"deleting label": {
@@ -285,7 +286,7 @@ func TestValidateProjectUpdate(t *testing.T) {
 					Annotations:     project.Annotations,
 				},
 			},
-			T: fielderrors.ValidationErrorTypeInvalid,
+			T: field.ErrorTypeInvalid,
 			F: "metadata.labels[label-name]",
 		},
 	}
@@ -296,10 +297,10 @@ func TestValidateProjectUpdate(t *testing.T) {
 			continue
 		}
 		for i := range errs {
-			if errs[i].(*fielderrors.ValidationError).Type != v.T {
+			if errs[i].Type != v.T {
 				t.Errorf("%s: expected errors to have type %s: %v", k, v.T, errs[i])
 			}
-			if errs[i].(*fielderrors.ValidationError).Field != v.F {
+			if errs[i].Field != v.F {
 				t.Errorf("%s: expected errors to have field %s: %v", k, v.F, errs[i])
 			}
 		}

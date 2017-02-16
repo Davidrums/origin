@@ -4,13 +4,11 @@ import (
 	"time"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	kclient "k8s.io/kubernetes/pkg/client"
 	"k8s.io/kubernetes/pkg/client/cache"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
+	kcoreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
 	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util"
-	kutil "k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/flowcontrol"
+	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 	"k8s.io/kubernetes/pkg/watch"
 
 	"github.com/openshift/origin/pkg/controller"
@@ -21,7 +19,7 @@ import (
 type AllocationFactory struct {
 	UIDAllocator uidallocator.Interface
 	MCSAllocator MCSAllocationFunc
-	Client       kclient.NamespaceInterface
+	Client       kcoreclient.NamespaceInterface
 	// Queue may be a FIFO queue of namespaces. If nil, will be initialized using
 	// the client.
 	Queue controller.ReQueue
@@ -31,14 +29,14 @@ type AllocationFactory struct {
 func (f *AllocationFactory) Create() controller.RunnableController {
 	if f.Queue == nil {
 		lw := &cache.ListWatch{
-			ListFunc: func() (runtime.Object, error) {
-				return f.Client.List(labels.Everything(), fields.Everything())
+			ListFunc: func(options kapi.ListOptions) (runtime.Object, error) {
+				return f.Client.List(options)
 			},
-			WatchFunc: func(resourceVersion string) (watch.Interface, error) {
-				return f.Client.Watch(labels.Everything(), fields.Everything(), resourceVersion)
+			WatchFunc: func(options kapi.ListOptions) (watch.Interface, error) {
+				return f.Client.Watch(options)
 			},
 		}
-		q := cache.NewFIFO(cache.MetaNamespaceKeyFunc)
+		q := cache.NewResyncableFIFO(cache.MetaNamespaceKeyFunc)
 		cache.NewReflector(lw, &kapi.Namespace{}, q, 10*time.Minute).Run()
 		f.Queue = q
 	}
@@ -55,10 +53,10 @@ func (f *AllocationFactory) Create() controller.RunnableController {
 			f.Queue,
 			cache.MetaNamespaceKeyFunc,
 			func(obj interface{}, err error, retries controller.Retry) bool {
-				util.HandleError(err)
+				utilruntime.HandleError(err)
 				return retries.Count < 5
 			},
-			kutil.NewTokenBucketRateLimiter(1, 10),
+			flowcontrol.NewTokenBucketRateLimiter(1, 10),
 		),
 		Handle: func(obj interface{}) error {
 			r := obj.(*kapi.Namespace)

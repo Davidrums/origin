@@ -2,8 +2,9 @@ package api
 
 import (
 	kapi "k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/unversioned"
 	kruntime "k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/sets"
 )
 
 // Authorization is calculated against
@@ -16,125 +17,74 @@ import (
 const (
 	// PolicyName is the name of Policy
 	PolicyName     = "default"
+	APIGroupAll    = "*"
 	ResourceAll    = "*"
 	VerbAll        = "*"
 	NonResourceAll = "*"
+
+	ScopesKey           = "authorization.openshift.io/scopes"
+	ScopesAllNamespaces = "*"
 
 	UserKind           = "User"
 	GroupKind          = "Group"
 	ServiceAccountKind = "ServiceAccount"
 	SystemUserKind     = "SystemUser"
 	SystemGroupKind    = "SystemGroup"
+
+	UserResource           = "users"
+	GroupResource          = "groups"
+	ServiceAccountResource = "serviceaccounts"
+	SystemUserResource     = "systemusers"
+	SystemGroupResource    = "systemgroups"
 )
 
-const (
-	// ResourceGroupPrefix is the prefix for indicating that a resource entry is actually a group of resources.  The groups are defined in code and indicate resources that are commonly permissioned together
-	ResourceGroupPrefix = "resourcegroup"
-	BuildGroupName      = ResourceGroupPrefix + ":builds"
-	DeploymentGroupName = ResourceGroupPrefix + ":deployments"
-	ImageGroupName      = ResourceGroupPrefix + ":images"
-	OAuthGroupName      = ResourceGroupPrefix + ":oauth"
-	UserGroupName       = ResourceGroupPrefix + ":users"
-	TemplateGroupName   = ResourceGroupPrefix + ":templates"
-	SDNGroupName        = ResourceGroupPrefix + ":sdn"
-	// PolicyOwnerGroupName includes the physical resources behind the PermissionGrantingGroupName.  Unless these physical objects are created first, users with privileges to PermissionGrantingGroupName will
-	// only be able to bind to global roles
-	PolicyOwnerGroupName = ResourceGroupPrefix + ":policy"
-	// PermissionGrantingGroupName includes resources that are necessary to maintain authorization roles and bindings.  By itself, this group is insufficient to create anything except for bindings
-	// to master roles.  If a local Policy already exists, then privileges to this group will allow for modification of local roles.
-	PermissionGrantingGroupName = ResourceGroupPrefix + ":granter"
-	// OpenshiftExposedGroupName includes resources that are commonly viewed and modified by end users of the system.  It does not include any sensitive resources that control authentication or authorization
-	OpenshiftExposedGroupName = ResourceGroupPrefix + ":exposedopenshift"
-	OpenshiftAllGroupName     = ResourceGroupPrefix + ":allopenshift"
-	OpenshiftStatusGroupName  = ResourceGroupPrefix + ":allopenshift-status"
+// DiscoveryRule is a rule that allows a client to discover the API resources available on this server
+var DiscoveryRule = PolicyRule{
+	Verbs: sets.NewString("get"),
+	NonResourceURLs: sets.NewString(
+		// Server version checking
+		"/version", "/version/*",
 
-	QuotaGroupName = ResourceGroupPrefix + ":quota"
-	// KubeInternalsGroupName includes those resources that should reasonably be viewable to end users, but that most users should probably not modify.  Kubernetes herself will maintain these resources
-	KubeInternalsGroupName = ResourceGroupPrefix + ":privatekube"
-	// KubeExposedGroupName includes resources that are commonly viewed and modified by end users of the system.
-	KubeExposedGroupName = ResourceGroupPrefix + ":exposedkube"
-	KubeAllGroupName     = ResourceGroupPrefix + ":allkube"
-	KubeStatusGroupName  = ResourceGroupPrefix + ":allkube-status"
-
-	// NonEscalatingResourcesGroupName contains all resources that can be viewed without exposing the risk of using view rights to locate a secret to escalate privileges.  For example, view
-	// rights on secrets could be used locate a secret that happened to be  serviceaccount token that has more privileges
-	NonEscalatingResourcesGroupName         = ResourceGroupPrefix + ":non-escalating"
-	KubeNonEscalatingViewableGroupName      = ResourceGroupPrefix + ":kube-non-escalating"
-	OpenshiftNonEscalatingViewableGroupName = ResourceGroupPrefix + ":openshift-non-escalating"
-
-	// EscalatingResourcesGroupName contains all resources that can be used to escalate privileges when simply viewed
-	EscalatingResourcesGroupName         = ResourceGroupPrefix + ":escalating"
-	KubeEscalatingViewableGroupName      = ResourceGroupPrefix + ":kube-escalating"
-	OpenshiftEscalatingViewableGroupName = ResourceGroupPrefix + ":openshift-escalating"
-)
-
-var (
-	GroupsToResources = map[string][]string{
-		BuildGroupName:       {"builds", "buildconfigs", "buildlogs", "buildconfigs/instantiate", "builds/log", "builds/clone", "buildconfigs/webhooks"},
-		ImageGroupName:       {"imagestreams", "imagestreammappings", "imagestreamtags", "imagestreamimages"},
-		DeploymentGroupName:  {"deployments", "deploymentconfigs", "generatedeploymentconfigs", "deploymentconfigrollbacks"},
-		SDNGroupName:         {"clusternetworks", "hostsubnets", "netnamespaces"},
-		TemplateGroupName:    {"templates", "templateconfigs", "processedtemplates"},
-		UserGroupName:        {"identities", "users", "useridentitymappings", "groups"},
-		OAuthGroupName:       {"oauthauthorizetokens", "oauthaccesstokens", "oauthclients", "oauthclientauthorizations"},
-		PolicyOwnerGroupName: {"policies", "policybindings"},
-
-		// RAR and SAR are in this list to support backwards compatibility with clients that expect access to those resource in a namespace scope and a cluster scope.
-		// TODO remove once we have eliminated the namespace scoped resource.
-		PermissionGrantingGroupName: {"roles", "rolebindings", "resourceaccessreviews" /* cluster scoped*/, "subjectaccessreviews" /* cluster scoped*/, "localresourceaccessreviews", "localsubjectaccessreviews"},
-		OpenshiftExposedGroupName:   {BuildGroupName, ImageGroupName, DeploymentGroupName, TemplateGroupName, "routes"},
-		OpenshiftAllGroupName: {OpenshiftExposedGroupName, UserGroupName, OAuthGroupName, PolicyOwnerGroupName, SDNGroupName, PermissionGrantingGroupName, OpenshiftStatusGroupName, "projects",
-			"clusterroles", "clusterrolebindings", "clusterpolicies", "clusterpolicybindings", "images" /* cluster scoped*/, "projectrequests"},
-		OpenshiftStatusGroupName: {"imagestreams/status"},
-
-		QuotaGroupName:         {"limitranges", "resourcequotas", "resourcequotausages"},
-		KubeInternalsGroupName: {"minions", "nodes", "bindings", "events", "namespaces"},
-		KubeExposedGroupName:   {"pods", "replicationcontrollers", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "pods/log"},
-		KubeAllGroupName:       {KubeInternalsGroupName, KubeExposedGroupName, QuotaGroupName},
-		KubeStatusGroupName:    {"pods/status", "resourcequotas/status", "namespaces/status"},
-
-		OpenshiftEscalatingViewableGroupName: {"oauthauthorizetokens", "oauthaccesstokens"},
-		KubeEscalatingViewableGroupName:      {"secrets"},
-		EscalatingResourcesGroupName:         {OpenshiftEscalatingViewableGroupName, KubeEscalatingViewableGroupName},
-
-		NonEscalatingResourcesGroupName: {OpenshiftNonEscalatingViewableGroupName, KubeNonEscalatingViewableGroupName},
-	}
-)
-
-func init() {
-	// set the non-escalating groups
-	GroupsToResources[OpenshiftNonEscalatingViewableGroupName] = ExpandResources(util.NewStringSet(GroupsToResources[OpenshiftAllGroupName]...)).
-		Difference(ExpandResources(util.NewStringSet(GroupsToResources[OpenshiftEscalatingViewableGroupName]...))).List()
-
-	GroupsToResources[KubeNonEscalatingViewableGroupName] = ExpandResources(util.NewStringSet(GroupsToResources[KubeAllGroupName]...)).
-		Difference(ExpandResources(util.NewStringSet(GroupsToResources[KubeEscalatingViewableGroupName]...))).List()
+		// API discovery/negotiation
+		"/api", "/api/*",
+		"/apis", "/apis/*",
+		"/oapi", "/oapi/*",
+		"/swaggerapi", "/swaggerapi/*",
+		"/osapi", "/osapi/", // these cannot be removed until we can drop support for pre 3.1 clients
+		"/.well-known", "/.well-known/*",
+	),
 }
 
 // PolicyRule holds information that describes a policy rule, but does not contain information
 // about who the rule applies to or which namespace the rule applies to.
 type PolicyRule struct {
 	// Verbs is a list of Verbs that apply to ALL the ResourceKinds and AttributeRestrictions contained in this rule.  VerbAll represents all kinds.
-	Verbs util.StringSet
+	Verbs sets.String
 	// AttributeRestrictions will vary depending on what the Authorizer/AuthorizationAttributeBuilder pair supports.
 	// If the Authorizer does not recognize how to handle the AttributeRestrictions, the Authorizer should report an error.
-	AttributeRestrictions kruntime.EmbeddedObject
+	AttributeRestrictions kruntime.Object
+	// APIGroups is the name of the APIGroup that contains the resources.  If this field is empty, then both kubernetes and origin API groups are assumed.
+	// That means that if an action is requested against one of the enumerated resources in either the kubernetes or the origin API group, the request
+	// will be allowed
+	APIGroups []string
 	// Resources is a list of resources this rule applies to.  ResourceAll represents all resources.
-	Resources util.StringSet
+	Resources sets.String
 	// ResourceNames is an optional white list of names that the rule applies to.  An empty set means that everything is allowed.
-	ResourceNames util.StringSet
+	ResourceNames sets.String
 	// NonResourceURLs is a set of partial urls that a user should have access to.  *s are allowed, but only as the full, final step in the path
 	// If an action is not a resource API request, then the URL is split on '/' and is checked against the NonResourceURLs to look for a match.
-	NonResourceURLs util.StringSet
+	NonResourceURLs sets.String
 }
 
 // IsPersonalSubjectAccessReview is a marker for PolicyRule.AttributeRestrictions that denotes that subjectaccessreviews on self should be allowed
 type IsPersonalSubjectAccessReview struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
 }
 
 // Role is a logical grouping of PolicyRules that can be referenced as a unit by RoleBindings.
 type Role struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
 	kapi.ObjectMeta
 
 	// Rules holds all the PolicyRules for this Role
@@ -145,7 +95,7 @@ type Role struct {
 // It adds who information via Users and Groups and namespace information by which namespace it exists in.  RoleBindings in a given
 // namespace only have effect in that namespace (excepting the master namespace which has power in all namespaces).
 type RoleBinding struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
 	kapi.ObjectMeta
 
 	// Subjects hold object references of to authorize with this rule
@@ -157,58 +107,121 @@ type RoleBinding struct {
 	RoleRef kapi.ObjectReference
 }
 
+type RolesByName map[string]*Role
+
+// +genclient=true
+
 // Policy is a object that holds all the Roles for a particular namespace.  There is at most
 // one Policy document per namespace.
 type Policy struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
 	kapi.ObjectMeta
 
 	// LastModified is the last time that any part of the Policy was created, updated, or deleted
-	LastModified util.Time
+	LastModified unversioned.Time
 
 	// Roles holds all the Roles held by this Policy, mapped by Role.Name
-	Roles map[string]*Role
+	Roles RolesByName
 }
+
+type RoleBindingsByName map[string]*RoleBinding
 
 // PolicyBinding is a object that holds all the RoleBindings for a particular namespace.  There is
 // one PolicyBinding document per referenced Policy namespace
 type PolicyBinding struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
 	kapi.ObjectMeta
 
 	// LastModified is the last time that any part of the PolicyBinding was created, updated, or deleted
-	LastModified util.Time
+	LastModified unversioned.Time
 
 	// PolicyRef is a reference to the Policy that contains all the Roles that this PolicyBinding's RoleBindings may reference
 	PolicyRef kapi.ObjectReference
 	// RoleBindings holds all the RoleBindings held by this PolicyBinding, mapped by RoleBinding.Name
-	RoleBindings map[string]*RoleBinding
+	RoleBindings RoleBindingsByName
+}
+
+// SelfSubjectRulesReview is a resource you can create to determine which actions you can perform in a namespace
+type SelfSubjectRulesReview struct {
+	unversioned.TypeMeta
+
+	// Spec adds information about how to conduct the check
+	Spec SelfSubjectRulesReviewSpec
+
+	// Status is completed by the server to tell which permissions you have
+	Status SubjectRulesReviewStatus
+}
+
+// SelfSubjectRulesReviewSpec adds information about how to conduct the check
+type SelfSubjectRulesReviewSpec struct {
+	// Scopes to use for the evaluation.  Empty means "use the unscoped (full) permissions of the user/groups".
+	// Nil for a self-SubjectRulesReview, means "use the scopes on this request".
+	// Nil for a regular SubjectRulesReview, means the same as empty.
+	Scopes []string
+}
+
+// SubjectRulesReview is a resource you can create to determine which actions another user can perform in a namespace
+type SubjectRulesReview struct {
+	unversioned.TypeMeta
+
+	// Spec adds information about how to conduct the check
+	Spec SubjectRulesReviewSpec
+
+	// Status is completed by the server to tell which permissions you have
+	Status SubjectRulesReviewStatus
+}
+
+// SubjectRulesReviewSpec adds information about how to conduct the check
+type SubjectRulesReviewSpec struct {
+	// User is optional.  At least one of User and Groups must be specified.
+	User string
+	// Groups is optional.  Groups is the list of groups to which the User belongs.  At least one of User and Groups must be specified.
+	Groups []string
+	// Scopes to use for the evaluation.  Empty means "use the unscoped (full) permissions of the user/groups".
+	Scopes []string
+}
+
+// SubjectRulesReviewStatus is contains the result of a rules check
+type SubjectRulesReviewStatus struct {
+	// Rules is the list of rules (no particular sort) that are allowed for the subject
+	Rules []PolicyRule
+	// EvaluationError can appear in combination with Rules.  It means some error happened during evaluation
+	// that may have prevented additional rules from being populated.
+	EvaluationError string
 }
 
 // ResourceAccessReviewResponse describes who can perform the action
 type ResourceAccessReviewResponse struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
 
 	// Namespace is the namespace used for the access review
 	Namespace string
 	// Users is the list of users who can perform the action
-	Users util.StringSet
+	// +k8s:conversion-gen=false
+	Users sets.String
 	// Groups is the list of groups who can perform the action
-	Groups util.StringSet
+	// +k8s:conversion-gen=false
+	Groups sets.String
+
+	// EvaluationError is an indication that some error occurred during resolution, but partial results can still be returned.
+	// It is entirely possible to get an error and be able to continue determine authorization status in spite of it.  This is
+	// most common when a bound role is missing, but enough roles are still present and bound to reason about the request.
+	EvaluationError string
 }
 
 // ResourceAccessReview is a means to request a list of which users and groups are authorized to perform the
 // action specified by spec
 type ResourceAccessReview struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
 
 	// Action describes the action being tested
-	Action AuthorizationAttributes
+	Action
 }
 
 // SubjectAccessReviewResponse describes whether or not a user or group can perform an action
 type SubjectAccessReviewResponse struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
 
 	// Namespace is the namespace used for the access review
 	Namespace string
@@ -216,57 +229,81 @@ type SubjectAccessReviewResponse struct {
 	Allowed bool
 	// Reason is optional.  It indicates why a request was allowed or denied.
 	Reason string
+	// EvaluationError is an indication that some error occurred during the authorization check.
+	// It is entirely possible to get an error and be able to continue determine authorization status in spite of it.  This is
+	// most common when a bound role is missing, but enough roles are still present and bound to reason about the request.
+	EvaluationError string
 }
 
 // SubjectAccessReview is an object for requesting information about whether a user or group can perform an action
 type SubjectAccessReview struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
 
 	// Action describes the action being tested
-	Action AuthorizationAttributes
+	Action
 	// User is optional.  If both User and Groups are empty, the current authenticated user is used.
 	User string
 	// Groups is optional.  Groups is the list of groups to which the User belongs.
-	Groups util.StringSet
+	// +k8s:conversion-gen=false
+	Groups sets.String
+	// Scopes to use for the evaluation.  Empty means "use the unscoped (full) permissions of the user/groups".
+	// Nil for a self-SAR, means "use the scopes on this request".
+	// Nil for a regular SAR, means the same as empty.
+	Scopes []string
 }
 
 // LocalResourceAccessReview is a means to request a list of which users and groups are authorized to perform the action specified by spec in a particular namespace
 type LocalResourceAccessReview struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
 
 	// Action describes the action being tested
-	Action AuthorizationAttributes
+	Action
 }
 
 // LocalSubjectAccessReview is an object for requesting information about whether a user or group can perform an action in a particular namespace
 type LocalSubjectAccessReview struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
 
 	// Action describes the action being tested.  The Namespace element is FORCED to the current namespace.
-	Action AuthorizationAttributes
+	Action
 	// User is optional.  If both User and Groups are empty, the current authenticated user is used.
 	User string
 	// Groups is optional.  Groups is the list of groups to which the User belongs.
-	Groups util.StringSet
+	// +k8s:conversion-gen=false
+	Groups sets.String
+	// Scopes to use for the evaluation.  Empty means "use the unscoped (full) permissions of the user/groups".
+	// Nil for a self-SAR, means "use the scopes on this request".
+	// Nil for a regular SAR, means the same as empty.
+	Scopes []string
 }
 
-type AuthorizationAttributes struct {
+// Action describes a request to be authorized
+type Action struct {
 	// Namespace is the namespace of the action being requested.  Currently, there is no distinction between no namespace and all namespaces
 	Namespace string
 	// Verb is one of: get, list, watch, create, update, delete
 	Verb string
+	// Group is the API group of the resource
+	Group string
+	// Version is the API version of the resource
+	Version string
 	// Resource is one of the existing resource types
 	Resource string
 	// ResourceName is the name of the resource being requested for a "get" or deleted for a "delete"
 	ResourceName string
+	// Path is the path of a non resource URL
+	Path string
+	// IsNonResourceURL is true if this is a request for a non-resource URL (outside of the resource hieraarchy)
+	IsNonResourceURL bool
 	// Content is the actual content of the request for create and update
-	Content kruntime.EmbeddedObject
+	Content kruntime.Object
 }
 
 // PolicyList is a collection of Policies
 type PolicyList struct {
-	kapi.TypeMeta
-	kapi.ListMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
+	unversioned.ListMeta
 
 	// Items is a list of policies
 	Items []Policy
@@ -274,8 +311,9 @@ type PolicyList struct {
 
 // PolicyBindingList is a collection of PolicyBindings
 type PolicyBindingList struct {
-	kapi.TypeMeta
-	kapi.ListMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
+	unversioned.ListMeta
 
 	// Items is a list of policyBindings
 	Items []PolicyBinding
@@ -283,8 +321,9 @@ type PolicyBindingList struct {
 
 // RoleBindingList is a collection of RoleBindings
 type RoleBindingList struct {
-	kapi.TypeMeta
-	kapi.ListMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
+	unversioned.ListMeta
 
 	// Items is a list of roleBindings
 	Items []RoleBinding
@@ -292,8 +331,9 @@ type RoleBindingList struct {
 
 // RoleList is a collection of Roles
 type RoleList struct {
-	kapi.TypeMeta
-	kapi.ListMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
+	unversioned.ListMeta
 
 	// Items is a list of roles
 	Items []Role
@@ -301,7 +341,8 @@ type RoleList struct {
 
 // ClusterRole is a logical grouping of PolicyRules that can be referenced as a unit by ClusterRoleBindings.
 type ClusterRole struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
 	kapi.ObjectMeta
 
 	// Rules holds all the PolicyRules for this ClusterRole
@@ -312,7 +353,8 @@ type ClusterRole struct {
 // It adds who information via Users and Groups and namespace information by which namespace it exists in.  ClusterRoleBindings in a given
 // namespace only have effect in that namespace (excepting the master namespace which has power in all namespaces).
 type ClusterRoleBinding struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
 	kapi.ObjectMeta
 
 	// Subjects hold object references of to authorize with this rule
@@ -324,38 +366,45 @@ type ClusterRoleBinding struct {
 	RoleRef kapi.ObjectReference
 }
 
+type ClusterRolesByName map[string]*ClusterRole
+
 // ClusterPolicy is a object that holds all the ClusterRoles for a particular namespace.  There is at most
 // one ClusterPolicy document per namespace.
 type ClusterPolicy struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
 	kapi.ObjectMeta
 
 	// LastModified is the last time that any part of the ClusterPolicy was created, updated, or deleted
-	LastModified util.Time
+	LastModified unversioned.Time
 
 	// Roles holds all the ClusterRoles held by this ClusterPolicy, mapped by Role.Name
-	Roles map[string]*ClusterRole
+	Roles ClusterRolesByName
 }
+
+type ClusterRoleBindingsByName map[string]*ClusterRoleBinding
 
 // ClusterPolicyBinding is a object that holds all the ClusterRoleBindings for a particular namespace.  There is
 // one ClusterPolicyBinding document per referenced ClusterPolicy namespace
 type ClusterPolicyBinding struct {
-	kapi.TypeMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
 	kapi.ObjectMeta
 
 	// LastModified is the last time that any part of the ClusterPolicyBinding was created, updated, or deleted
-	LastModified util.Time
+	LastModified unversioned.Time
 
 	// ClusterPolicyRef is a reference to the ClusterPolicy that contains all the ClusterRoles that this ClusterPolicyBinding's RoleBindings may reference
 	PolicyRef kapi.ObjectReference
 	// RoleBindings holds all the RoleBindings held by this ClusterPolicyBinding, mapped by RoleBinding.Name
-	RoleBindings map[string]*ClusterRoleBinding
+	RoleBindings ClusterRoleBindingsByName
 }
 
 // ClusterPolicyList is a collection of ClusterPolicies
 type ClusterPolicyList struct {
-	kapi.TypeMeta
-	kapi.ListMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
+	unversioned.ListMeta
 
 	// Items is a list of ClusterPolicies
 	Items []ClusterPolicy
@@ -363,8 +412,9 @@ type ClusterPolicyList struct {
 
 // ClusterPolicyBindingList is a collection of ClusterPolicyBindings
 type ClusterPolicyBindingList struct {
-	kapi.TypeMeta
-	kapi.ListMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
+	unversioned.ListMeta
 
 	// Items is a list of ClusterPolicyBindings
 	Items []ClusterPolicyBinding
@@ -372,8 +422,9 @@ type ClusterPolicyBindingList struct {
 
 // ClusterRoleBindingList is a collection of ClusterRoleBindings
 type ClusterRoleBindingList struct {
-	kapi.TypeMeta
-	kapi.ListMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
+	unversioned.ListMeta
 
 	// Items is a list of ClusterRoleBindings
 	Items []ClusterRoleBinding
@@ -381,9 +432,100 @@ type ClusterRoleBindingList struct {
 
 // ClusterRoleList is a collection of ClusterRoles
 type ClusterRoleList struct {
-	kapi.TypeMeta
-	kapi.ListMeta
+	unversioned.TypeMeta
+	// Standard object's metadata.
+	unversioned.ListMeta
 
 	// Items is a list of ClusterRoles
 	Items []ClusterRole
+}
+
+// RoleBindingRestriction is an object that can be matched against a subject
+// (user, group, or service account) to determine whether rolebindings on that
+// subject are allowed in the namespace to which the RoleBindingRestriction
+// belongs.  If any one of those RoleBindingRestriction objects matches
+// a subject, rolebindings on that subject in the namespace are allowed.
+type RoleBindingRestriction struct {
+	unversioned.TypeMeta
+
+	// Standard object's metadata.
+	kapi.ObjectMeta
+
+	// Spec defines the matcher.
+	Spec RoleBindingRestrictionSpec
+}
+
+// RoleBindingRestrictionSpec defines a rolebinding restriction.  Exactly one
+// field must be non-nil.
+type RoleBindingRestrictionSpec struct {
+	// UserRestriction matches against user subjects.
+	UserRestriction *UserRestriction
+
+	// GroupRestriction matches against group subjects.
+	GroupRestriction *GroupRestriction
+
+	// ServiceAccountRestriction matches against service-account subjects.
+	ServiceAccountRestriction *ServiceAccountRestriction
+}
+
+// RoleBindingRestrictionList is a collection of RoleBindingRestriction objects.
+type RoleBindingRestrictionList struct {
+	unversioned.TypeMeta
+
+	// Standard object's metadata.
+	unversioned.ListMeta
+
+	// Items is a list of RoleBindingRestriction objects.
+	Items []RoleBindingRestriction
+}
+
+// UserRestriction matches a user either by a string match on the user name,
+// a string match on the name of a group to which the user belongs, or a label
+// selector applied to the user labels.
+type UserRestriction struct {
+	// Users specifies a list of literal user names.
+	Users []string
+
+	// Groups is a list of groups used to match against an individual user's
+	// groups. If the user is a member of one of the whitelisted groups, the user
+	// is allowed to be bound to a role.
+	Groups []string
+
+	// Selectors specifies a list of label selectors over user labels.
+	Selectors []unversioned.LabelSelector
+}
+
+// GroupRestriction matches a group either by a string match on the group name
+// or a label selector applied to group labels.
+type GroupRestriction struct {
+	// Groups specifies a list of literal group names.
+	Groups []string
+
+	// Selectors specifies a list of label selectors over group labels.
+	Selectors []unversioned.LabelSelector
+}
+
+// ServiceAccountRestriction matches a service account by a string match on
+// either the service-account name or the name of the service account's
+// namespace.
+type ServiceAccountRestriction struct {
+	// ServiceAccounts specifies a list of literal service-account names.
+	ServiceAccounts []ServiceAccountReference
+
+	// Namespaces specifies a list of literal namespace names.  ServiceAccounts
+	// from inside the whitelisted namespaces are allowed to be bound to roles.
+	Namespaces []string
+}
+
+// ServiceAccountReference specifies a service account and namespace by their
+// names.
+type ServiceAccountReference struct {
+	// Name is the name of the service account.
+	Name string
+
+	// Namespace is the namespace of the service account.  Service accounts from
+	// inside the whitelisted namespaces are allowed to be bound to roles.  If
+	// Namespace is empty, then the namespace of the RoleBindingRestriction in
+	// which the ServiceAccountReference is embedded is used.
+	Namespace string
 }

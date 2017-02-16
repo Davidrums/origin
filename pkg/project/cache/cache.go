@@ -2,38 +2,52 @@ package cache
 
 import (
 	"fmt"
+	"time"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client"
 	"k8s.io/kubernetes/pkg/client/cache"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
+	kcoreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
 	"k8s.io/kubernetes/pkg/runtime"
 	"k8s.io/kubernetes/pkg/watch"
 
+	"github.com/golang/glog"
 	projectapi "github.com/openshift/origin/pkg/project/api"
 	"github.com/openshift/origin/pkg/util/labelselector"
 )
 
+// NewProjectCache returns a non-initialized ProjectCache. The cache needs to be run to begin functioning
+func NewProjectCache(client kcoreclient.NamespaceInterface, defaultNodeSelector string) *ProjectCache {
+	return &ProjectCache{
+		Client:              client,
+		DefaultNodeSelector: defaultNodeSelector,
+	}
+}
+
 type ProjectCache struct {
-	Client              client.Interface
-	Store               cache.Store
+	Client              kcoreclient.NamespaceInterface
+	Store               cache.Indexer
 	DefaultNodeSelector string
 }
 
-var pcache *ProjectCache
+func (p *ProjectCache) GetNamespace(name string) (*kapi.Namespace, error) {
+	key := &kapi.Namespace{ObjectMeta: kapi.ObjectMeta{Name: name}}
 
-func (p *ProjectCache) GetNamespaceObject(name string) (*kapi.Namespace, error) {
 	// check for namespace in the cache
-	namespaceObj, exists, err := p.Store.Get(&kapi.Namespace{
-		ObjectMeta: kapi.ObjectMeta{
-			Name:      name,
-			Namespace: "",
-		},
-		Status: kapi.NamespaceStatus{},
-	})
+	namespaceObj, exists, err := p.Store.Get(key)
 	if err != nil {
 		return nil, err
+	}
+
+	if !exists {
+		// give the cache time to observe a recent namespace creation
+		time.Sleep(50 * time.Millisecond)
+		namespaceObj, exists, err = p.Store.Get(key)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			glog.V(4).Infof("found %s in cache after waiting", name)
+		}
 	}
 
 	var namespace *kapi.Namespace
@@ -41,11 +55,12 @@ func (p *ProjectCache) GetNamespaceObject(name string) (*kapi.Namespace, error) 
 		namespace = namespaceObj.(*kapi.Namespace)
 	} else {
 		// Our watch maybe latent, so we make a best effort to get the object, and only fail if not found
-		namespace, err = p.Client.Namespaces().Get(name)
+		namespace, err = p.Client.Get(name)
 		// the namespace does not exist, so prevent create and update in that namespace
 		if err != nil {
 			return nil, fmt.Errorf("namespace %s does not exist", name)
 		}
+		glog.V(4).Infof("found %s via storage lookup", name)
 	}
 	return namespace, nil
 }
@@ -74,26 +89,16 @@ func (p *ProjectCache) GetNodeSelectorMap(namespace *kapi.Namespace) (map[string
 	return labelsMap, nil
 }
 
-func GetProjectCache() (*ProjectCache, error) {
-	if pcache == nil {
-		return nil, fmt.Errorf("project cache not initialized")
-	}
-	return pcache, nil
-}
-
-func RunProjectCache(c client.Interface, defaultNodeSelector string) {
-	if pcache != nil {
-		return
-	}
-
-	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+// Run builds the store that backs this cache and runs the backing reflector
+func (c *ProjectCache) Run() {
+	store := NewCacheStore(cache.MetaNamespaceKeyFunc)
 	reflector := cache.NewReflector(
 		&cache.ListWatch{
-			ListFunc: func() (runtime.Object, error) {
-				return c.Namespaces().List(labels.Everything(), fields.Everything())
+			ListFunc: func(options kapi.ListOptions) (runtime.Object, error) {
+				return c.Client.List(options)
 			},
-			WatchFunc: func(resourceVersion string) (watch.Interface, error) {
-				return c.Namespaces().Watch(labels.Everything(), fields.Everything(), resourceVersion)
+			WatchFunc: func(options kapi.ListOptions) (watch.Interface, error) {
+				return c.Client.Watch(options)
 			},
 		},
 		&kapi.Namespace{},
@@ -101,18 +106,32 @@ func RunProjectCache(c client.Interface, defaultNodeSelector string) {
 		0,
 	)
 	reflector.Run()
-	pcache = &ProjectCache{
+	c.Store = store
+}
+
+// Running determines if the cache is initialized and running
+func (c *ProjectCache) Running() bool {
+	return c.Store != nil
+}
+
+// NewFake is used for testing purpose only
+func NewFake(c kcoreclient.NamespaceInterface, store cache.Indexer, defaultNodeSelector string) *ProjectCache {
+	return &ProjectCache{
 		Client:              c,
 		Store:               store,
 		DefaultNodeSelector: defaultNodeSelector,
 	}
 }
 
-// Used for testing purpose only
-func FakeProjectCache(c client.Interface, store cache.Store, defaultNodeSelector string) {
-	pcache = &ProjectCache{
-		Client:              c,
-		Store:               store,
-		DefaultNodeSelector: defaultNodeSelector,
-	}
+// NewCacheStore creates an Indexer store with the given key function
+func NewCacheStore(keyFn cache.KeyFunc) cache.Indexer {
+	return cache.NewIndexer(keyFn, cache.Indexers{
+		"requester": indexNamespaceByRequester,
+	})
+}
+
+// indexNamespaceByRequester returns the requester for a given namespace object as an index value
+func indexNamespaceByRequester(obj interface{}) ([]string, error) {
+	requester := obj.(*kapi.Namespace).Annotations[projectapi.ProjectRequester]
+	return []string{requester}, nil
 }

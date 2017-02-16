@@ -1,10 +1,9 @@
 package version
 
 import (
-	"fmt"
+	"strings"
 
-	"github.com/spf13/cobra"
-	kubeversion "k8s.io/kubernetes/pkg/version"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
@@ -18,6 +17,8 @@ var (
 	majorFromGit string
 	// minor version
 	minorFromGit string
+	// build date in ISO8601 format, output of $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+	buildDate string
 )
 
 // Info contains versioning information.
@@ -28,6 +29,7 @@ type Info struct {
 	Minor      string `json:"minor"`
 	GitCommit  string `json:"gitCommit"`
 	GitVersion string `json:"gitVersion"`
+	BuildDate  string `json:"buildDate"`
 }
 
 // Get returns the overall codebase version. It's for detecting
@@ -38,6 +40,7 @@ func Get() Info {
 		Minor:      minorFromGit,
 		GitCommit:  commitFromGit,
 		GitVersion: versionFromGit,
+		BuildDate:  buildDate,
 	}
 }
 
@@ -50,14 +53,23 @@ func (info Info) String() string {
 	return version
 }
 
-// NewVersionCommand creates a command for displaying the version of this binary
-func NewVersionCommand(basename string) *cobra.Command {
-	return &cobra.Command{
-		Use:   "version",
-		Short: "Display version",
-		Run: func(c *cobra.Command, args []string) {
-			fmt.Printf("%s %v\n", basename, Get())
-			fmt.Printf("kubernetes %v\n", kubeversion.Get())
+// LastSemanticVersion attempts to return a semantic version from the GitVersion - which
+// is either <semver>+<commit> or <semver> on release boundaries.
+func (info Info) LastSemanticVersion() string {
+	version := info.GitVersion
+	parts := strings.Split(version, "+")
+	return parts[0]
+}
+
+func init() {
+	buildInfo := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "openshift_build_info",
+			Help: "A metric with a constant '1' value labeled by major, minor, git commit & git version from which OpenShift was built.",
 		},
-	}
+		[]string{"major", "minor", "gitCommit", "gitVersion"},
+	)
+	buildInfo.WithLabelValues(majorFromGit, minorFromGit, commitFromGit, versionFromGit).Set(1)
+
+	prometheus.MustRegister(buildInfo)
 }

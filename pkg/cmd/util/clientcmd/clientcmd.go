@@ -8,8 +8,9 @@ import (
 	"github.com/golang/glog"
 	"github.com/spf13/pflag"
 	"k8s.io/kubernetes/pkg/api"
-	kclient "k8s.io/kubernetes/pkg/client"
-	"k8s.io/kubernetes/pkg/client/clientcmd"
+	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	"k8s.io/kubernetes/pkg/client/restclient"
+	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
 
 	osclient "github.com/openshift/origin/pkg/client"
 	"github.com/openshift/origin/pkg/cmd/flagtypes"
@@ -26,12 +27,14 @@ type Config struct {
 	// If omitted defaults to the master.
 	KubernetesAddr flagtypes.Addr
 	// CommonConfig is the shared base config for both the OpenShift config and Kubernetes config
-	CommonConfig kclient.Config
+	CommonConfig restclient.Config
 	// Namespace is the namespace to act in
 	Namespace string
 
 	// If set, allow kubeconfig file loading
-	FromFile     bool
+	FromFile bool
+	// If true, no environment is loaded (for testing, primarily)
+	SkipEnv      bool
 	clientConfig clientcmd.ClientConfig
 }
 
@@ -40,12 +43,36 @@ func NewConfig() *Config {
 	return &Config{
 		MasterAddr:     flagtypes.Addr{Value: "localhost:8080", DefaultScheme: "http", DefaultPort: 8080, AllowPrefix: true}.Default(),
 		KubernetesAddr: flagtypes.Addr{Value: "localhost:8080", DefaultScheme: "http", DefaultPort: 8080}.Default(),
-		CommonConfig:   kclient.Config{},
+		CommonConfig:   restclient.Config{},
+	}
+}
+
+// AnonymousClientConfig returns a copy of the given config with all user credentials (cert/key, bearer token, and username/password) removed
+func AnonymousClientConfig(config *restclient.Config) restclient.Config {
+	// copy only known safe fields
+	// TODO: expose a copy method on the config that is "auth free"
+	return restclient.Config{
+		Host:          config.Host,
+		APIPath:       config.APIPath,
+		Prefix:        config.Prefix,
+		ContentConfig: config.ContentConfig,
+		TLSClientConfig: restclient.TLSClientConfig{
+			CAFile: config.TLSClientConfig.CAFile,
+			CAData: config.TLSClientConfig.CAData,
+		},
+		RateLimiter:   config.RateLimiter,
+		Insecure:      config.Insecure,
+		UserAgent:     config.UserAgent,
+		Transport:     config.Transport,
+		WrapTransport: config.WrapTransport,
+		QPS:           config.QPS,
+		Burst:         config.Burst,
+		Timeout:       config.Timeout,
 	}
 }
 
 // BindClientConfigSecurityFlags adds flags for the supplied client config
-func BindClientConfigSecurityFlags(config *kclient.Config, flags *pflag.FlagSet) {
+func BindClientConfigSecurityFlags(config *restclient.Config, flags *pflag.FlagSet) {
 	flags.BoolVar(&config.Insecure, "insecure-skip-tls-verify", config.Insecure, "If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure.")
 	flags.StringVar(&config.CertFile, "client-certificate", config.CertFile, "Path to a client certificate file for TLS.")
 	flags.StringVar(&config.KeyFile, "client-key", config.KeyFile, "Path to a client key file for TLS.")
@@ -63,6 +90,13 @@ func (cfg *Config) Bind(flags *pflag.FlagSet) {
 	} else {
 		BindClientConfigSecurityFlags(&cfg.CommonConfig, flags)
 	}
+}
+
+// BindToFile is used when this config will not be bound to flags, but should load the config file
+// from disk if available.
+func (cfg *Config) BindToFile() *Config {
+	cfg.clientConfig = DefaultClientConfig(pflag.NewFlagSet("empty", pflag.ContinueOnError))
+	return cfg
 }
 
 func EnvVars(host string, caData []byte, insecure bool, bearerTokenFile string) []api.EnvVar {
@@ -85,9 +119,15 @@ func EnvVars(host string, caData []byte, insecure bool, bearerTokenFile string) 
 }
 
 func (cfg *Config) bindEnv() error {
+	// bypass loading from env
+	if cfg.SkipEnv {
+		return nil
+	}
 	var err error
 
-	// callers may not use the config file if they have specified a master directly
+	// callers may not use the config file if they have specified a master directly, for backwards
+	// compatibility with components that used to use env, switch to service account token, and have
+	// config defined in env.
 	_, masterSet := util.GetEnv("OPENSHIFT_MASTER")
 	specifiedMaster := masterSet || cfg.MasterAddr.Provided
 
@@ -101,6 +141,7 @@ func (cfg *Config) bindEnv() error {
 		if err != nil {
 			return err
 		}
+
 		if !cfg.MasterAddr.Provided {
 			cfg.MasterAddr.Set(cfg.CommonConfig.Host)
 		}
@@ -157,7 +198,7 @@ func (cfg *Config) bindEnv() error {
 }
 
 // KubeConfig returns the Kubernetes configuration
-func (cfg *Config) KubeConfig() *kclient.Config {
+func (cfg *Config) KubeConfig() *restclient.Config {
 	err := cfg.bindEnv()
 	if err != nil {
 		glog.Error(err)
@@ -175,23 +216,25 @@ func (cfg *Config) KubeConfig() *kclient.Config {
 }
 
 // OpenShiftConfig returns the OpenShift configuration
-func (cfg *Config) OpenShiftConfig() *kclient.Config {
+func (cfg *Config) OpenShiftConfig() *restclient.Config {
 	err := cfg.bindEnv()
 	if err != nil {
 		glog.Error(err)
 	}
 
 	osConfig := cfg.CommonConfig
-	osConfig.Host = cfg.MasterAddr.String()
+	if len(osConfig.Host) == 0 || cfg.MasterAddr.Provided {
+		osConfig.Host = cfg.MasterAddr.String()
+	}
 
 	return &osConfig
 }
 
 // Clients returns an OpenShift and a Kubernetes client from a given configuration
-func (cfg *Config) Clients() (osclient.Interface, kclient.Interface, error) {
+func (cfg *Config) Clients() (osclient.Interface, kclientset.Interface, error) {
 	cfg.bindEnv()
 
-	kubeClient, err := kclient.New(cfg.KubeConfig())
+	kubeClientset, err := kclientset.NewForConfig(cfg.KubeConfig())
 	if err != nil {
 		return nil, nil, fmt.Errorf("Unable to configure Kubernetes client: %v", err)
 	}
@@ -201,5 +244,5 @@ func (cfg *Config) Clients() (osclient.Interface, kclient.Interface, error) {
 		return nil, nil, fmt.Errorf("Unable to configure Origin client: %v", err)
 	}
 
-	return osClient, kubeClient, nil
+	return osClient, kubeClientset, nil
 }

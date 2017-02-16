@@ -6,7 +6,8 @@ import (
 	"testing"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/diff"
+	"k8s.io/kubernetes/pkg/util/sets"
 
 	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
 	"github.com/openshift/origin/pkg/authorization/authorizer"
@@ -19,14 +20,14 @@ type resourceAccessTest struct {
 }
 
 type testAuthorizer struct {
-	users  util.StringSet
-	groups util.StringSet
+	users  sets.String
+	groups sets.String
 	err    string
 
 	actualAttributes authorizer.DefaultAuthorizationAttributes
 }
 
-func (a *testAuthorizer) Authorize(ctx kapi.Context, attributes authorizer.AuthorizationAttributes) (allowed bool, reason string, err error) {
+func (a *testAuthorizer) Authorize(ctx kapi.Context, attributes authorizer.Action) (allowed bool, reason string, err error) {
 	// allow the initial check for "can I run this RAR at all"
 	if attributes.GetResource() == "localresourceaccessreviews" {
 		return true, "", nil
@@ -34,7 +35,7 @@ func (a *testAuthorizer) Authorize(ctx kapi.Context, attributes authorizer.Autho
 
 	return false, "", errors.New("Unsupported")
 }
-func (a *testAuthorizer) GetAllowedSubjects(ctx kapi.Context, passedAttributes authorizer.AuthorizationAttributes) (util.StringSet, util.StringSet, error) {
+func (a *testAuthorizer) GetAllowedSubjects(ctx kapi.Context, passedAttributes authorizer.Action) (sets.String, sets.String, error) {
 	attributes, ok := passedAttributes.(authorizer.DefaultAuthorizationAttributes)
 	if !ok {
 		return nil, nil, errors.New("unexpected type for test")
@@ -53,7 +54,7 @@ func TestNoNamespace(t *testing.T) {
 			err: "namespace is required on this type: ",
 		},
 		reviewRequest: &authorizationapi.LocalResourceAccessReview{
-			Action: authorizationapi.AuthorizationAttributes{
+			Action: authorizationapi.Action{
 				Namespace: "",
 				Verb:      "get",
 				Resource:  "pods",
@@ -67,7 +68,7 @@ func TestNoNamespace(t *testing.T) {
 func TestConflictingNamespace(t *testing.T) {
 	authorizer := &testAuthorizer{}
 	reviewRequest := &authorizationapi.LocalResourceAccessReview{
-		Action: authorizationapi.AuthorizationAttributes{
+		Action: authorizationapi.Action{
 			Namespace: "foo",
 			Verb:      "get",
 			Resource:  "pods",
@@ -80,7 +81,7 @@ func TestConflictingNamespace(t *testing.T) {
 	if err == nil {
 		t.Fatalf("unexpected non-error: %v", err)
 	}
-	if e, a := "namespace: invalid value 'foo', Details: namespace must be: bar", err.Error(); e != a {
+	if e, a := `namespace: Invalid value: "foo": namespace must be: bar`, err.Error(); e != a {
 		t.Fatalf("expected %v, got %v", e, a)
 	}
 }
@@ -88,11 +89,11 @@ func TestConflictingNamespace(t *testing.T) {
 func TestEmptyReturn(t *testing.T) {
 	test := &resourceAccessTest{
 		authorizer: &testAuthorizer{
-			users:  util.StringSet{},
-			groups: util.StringSet{},
+			users:  sets.String{},
+			groups: sets.String{},
 		},
 		reviewRequest: &authorizationapi.LocalResourceAccessReview{
-			Action: authorizationapi.AuthorizationAttributes{
+			Action: authorizationapi.Action{
 				Namespace: "unittest",
 				Verb:      "get",
 				Resource:  "pods",
@@ -106,33 +107,14 @@ func TestEmptyReturn(t *testing.T) {
 func TestNoErrors(t *testing.T) {
 	test := &resourceAccessTest{
 		authorizer: &testAuthorizer{
-			users:  util.NewStringSet("one", "two"),
-			groups: util.NewStringSet("three", "four"),
+			users:  sets.NewString("one", "two"),
+			groups: sets.NewString("three", "four"),
 		},
 		reviewRequest: &authorizationapi.LocalResourceAccessReview{
-			Action: authorizationapi.AuthorizationAttributes{
+			Action: authorizationapi.Action{
 				Namespace: "unittest",
 				Verb:      "delete",
 				Resource:  "deploymentConfig",
-			},
-		},
-	}
-
-	test.runTest(t)
-}
-
-func TestErrors(t *testing.T) {
-	test := &resourceAccessTest{
-		authorizer: &testAuthorizer{
-			users:  util.StringSet{},
-			groups: util.StringSet{},
-			err:    "some-random-failure",
-		},
-		reviewRequest: &authorizationapi.LocalResourceAccessReview{
-			Action: authorizationapi.AuthorizationAttributes{
-				Namespace: "unittest",
-				Verb:      "get",
-				Resource:  "pods",
 			},
 		},
 	}
@@ -170,7 +152,7 @@ func (r *resourceAccessTest) runTest(t *testing.T) {
 	switch obj.(type) {
 	case *authorizationapi.ResourceAccessReviewResponse:
 		if !reflect.DeepEqual(expectedResponse, obj) {
-			t.Errorf("diff %v", util.ObjectGoPrintDiff(expectedResponse, obj))
+			t.Errorf("diff %v", diff.ObjectGoPrintDiff(expectedResponse, obj))
 		}
 	case nil:
 		if len(r.authorizer.err) == 0 {
@@ -181,6 +163,6 @@ func (r *resourceAccessTest) runTest(t *testing.T) {
 	}
 
 	if !reflect.DeepEqual(expectedAttributes, r.authorizer.actualAttributes) {
-		t.Errorf("diff %v", util.ObjectGoPrintDiff(expectedAttributes, r.authorizer.actualAttributes))
+		t.Errorf("diff %v", diff.ObjectGoPrintDiff(expectedAttributes, r.authorizer.actualAttributes))
 	}
 }

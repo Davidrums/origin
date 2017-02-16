@@ -9,38 +9,41 @@ import (
 
 	"github.com/spf13/cobra"
 
-	kclient "k8s.io/kubernetes/pkg/client"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/api/errors"
+	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 
 	"github.com/openshift/origin/pkg/build/api"
 	buildutil "github.com/openshift/origin/pkg/build/util"
+	"github.com/openshift/origin/pkg/cmd/templates"
 	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
 )
 
-const (
-	buildLogsLong = `
-Retrieve logs for a build
+var (
+	buildLogsLong = templates.LongDesc(`
+		Retrieve logs for a build
 
-This command displays the log for the provided build. If the pod that ran the build has been deleted logs
-will no longer be available. If the build has not yet completed, the build logs will be streamed until the
-build completes or fails.`
+		This command displays the log for the provided build. If the pod that ran the build has been deleted logs
+		will no longer be available. If the build has not yet completed, the build logs will be streamed until the
+		build completes or fails.`)
 
-	buildLogsExample = `  // Stream logs from container
-  $ %[1]s build-logs 566bed879d2d`
+	buildLogsExample = templates.Examples(`
+		# Stream logs from container
+  	%[1]s build-logs 566bed879d2d`)
 )
 
 // NewCmdBuildLogs implements the OpenShift cli build-logs command
 func NewCmdBuildLogs(fullName string, f *clientcmd.Factory, out io.Writer) *cobra.Command {
 	opts := api.BuildLogOptions{}
 	cmd := &cobra.Command{
-		Use:     "build-logs BUILD",
-		Short:   "Show logs from a build",
-		Long:    buildLogsLong,
-		Example: fmt.Sprintf(buildLogsExample, fullName),
+		Use:        "build-logs BUILD",
+		Short:      "Show logs from a build",
+		Long:       buildLogsLong,
+		Example:    fmt.Sprintf(buildLogsExample, fullName),
+		Deprecated: fmt.Sprintf("use \"oc %v build/<build-name>\" instead.", LogsRecommendedCommandName),
 		Run: func(cmd *cobra.Command, args []string) {
 			err := RunBuildLogs(fullName, f, out, cmd, opts, args)
 
-			if err, ok := err.(kclient.APIStatus); ok {
+			if err, ok := err.(errors.APIStatus); ok {
 				if msg := err.Status().Message; strings.HasSuffix(msg, buildutil.NoBuildLogsMessage) {
 					fmt.Fprintf(out, msg)
 					os.Exit(1)
@@ -55,7 +58,7 @@ func NewCmdBuildLogs(fullName string, f *clientcmd.Factory, out io.Writer) *cobr
 					os.Exit(1)
 				}
 			}
-			cmdutil.CheckErr(err)
+			kcmdutil.CheckErr(err)
 		},
 	}
 	cmd.Flags().BoolVarP(&opts.Follow, "follow", "f", true, "Specify whether logs should be followed; default is true.")
@@ -66,12 +69,12 @@ func NewCmdBuildLogs(fullName string, f *clientcmd.Factory, out io.Writer) *cobr
 // RunBuildLogs contains all the necessary functionality for the OpenShift cli build-logs command
 func RunBuildLogs(fullName string, f *clientcmd.Factory, out io.Writer, cmd *cobra.Command, opts api.BuildLogOptions, args []string) error {
 	if len(args) != 1 {
-		cmdNamespace := cmdutil.GetFlagString(cmd, "namespace")
+		cmdNamespace := kcmdutil.GetFlagString(cmd, "namespace")
 		var namespace string
 		if cmdNamespace != "" {
 			namespace = " -n " + cmdNamespace
 		}
-		return cmdutil.UsageError(cmd, "A build name is required - you can run `%s get builds%s` to list builds", fullName, namespace)
+		return kcmdutil.UsageError(cmd, "A build name is required - you can run `%s get builds%s` to list builds", fullName, namespace)
 	}
 
 	namespace, _, err := f.DefaultNamespace()

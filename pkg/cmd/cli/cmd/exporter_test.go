@@ -10,10 +10,14 @@ import (
 	deployapi "github.com/openshift/origin/pkg/deploy/api"
 	deploytest "github.com/openshift/origin/pkg/deploy/api/test"
 	imageapi "github.com/openshift/origin/pkg/image/api"
+	osautil "github.com/openshift/origin/pkg/serviceaccounts/util"
 )
 
 func TestExport(t *testing.T) {
-	exporter := &defaultExporter{}
+	exporter := &DefaultExporter{}
+
+	baseSA := &kapi.ServiceAccount{}
+	baseSA.Name = "my-sa"
 
 	tests := []struct {
 		name        string
@@ -27,13 +31,11 @@ func TestExport(t *testing.T) {
 			object: deploytest.OkDeploymentConfig(1),
 			expectedObj: &deployapi.DeploymentConfig{
 				ObjectMeta: kapi.ObjectMeta{
-					Name: "config",
+					Name:       "config",
+					Generation: 1,
 				},
-				LatestVersion: 0,
-				Triggers: []deployapi.DeploymentTriggerPolicy{
-					deploytest.OkImageChangeTrigger(),
-				},
-				Template: deploytest.OkDeploymentTemplate(),
+				Spec:   deploytest.OkDeploymentConfigSpec(),
+				Status: deployapi.DeploymentConfigStatus{},
 			},
 			expectedErr: nil,
 		},
@@ -82,15 +84,79 @@ func TestExport(t *testing.T) {
 			},
 			expectedErr: nil,
 		},
+		{
+			name: "remove unexportable SA secrets",
+			object: &kapi.ServiceAccount{
+				ObjectMeta: kapi.ObjectMeta{
+					Name: baseSA.Name,
+				},
+				ImagePullSecrets: []kapi.LocalObjectReference{
+					{Name: osautil.GetDockercfgSecretNamePrefix(baseSA) + "-foo"},
+					{Name: "another-pull-secret"},
+				},
+				Secrets: []kapi.ObjectReference{
+					{Name: osautil.GetDockercfgSecretNamePrefix(baseSA) + "-foo"},
+					{Name: osautil.GetTokenSecretNamePrefix(baseSA) + "-foo"},
+					{Name: "another-mountable-secret"},
+				},
+			},
+			expectedObj: &kapi.ServiceAccount{
+				ObjectMeta: kapi.ObjectMeta{
+					Name: baseSA.Name,
+				},
+				ImagePullSecrets: []kapi.LocalObjectReference{
+					{Name: "another-pull-secret"},
+				},
+				Secrets: []kapi.ObjectReference{
+					{Name: "another-mountable-secret"},
+				},
+			},
+			expectedErr: nil,
+		},
+		{
+			name: "do not remove unexportable SA secrets with exact",
+			object: &kapi.ServiceAccount{
+				ObjectMeta: kapi.ObjectMeta{
+					Name: baseSA.Name,
+				},
+				ImagePullSecrets: []kapi.LocalObjectReference{
+					{Name: osautil.GetDockercfgSecretNamePrefix(baseSA) + "-foo"},
+					{Name: "another-pull-secret"},
+				},
+				Secrets: []kapi.ObjectReference{
+					{Name: osautil.GetDockercfgSecretNamePrefix(baseSA) + "-foo"},
+					{Name: osautil.GetTokenSecretNamePrefix(baseSA) + "-foo"},
+					{Name: "another-mountable-secret"},
+				},
+			},
+			expectedObj: &kapi.ServiceAccount{
+				ObjectMeta: kapi.ObjectMeta{
+					Name: baseSA.Name,
+				},
+				ImagePullSecrets: []kapi.LocalObjectReference{
+					{Name: osautil.GetDockercfgSecretNamePrefix(baseSA) + "-foo"},
+					{Name: "another-pull-secret"},
+				},
+				Secrets: []kapi.ObjectReference{
+					{Name: osautil.GetDockercfgSecretNamePrefix(baseSA) + "-foo"},
+					{Name: osautil.GetTokenSecretNamePrefix(baseSA) + "-foo"},
+					{Name: "another-mountable-secret"},
+				},
+			},
+			exact:       true,
+			expectedErr: nil,
+		},
 	}
 
-	for _, test := range tests {
+	for i := range tests {
+		test := tests[i]
+
 		if err := exporter.Export(test.object, test.exact); err != test.expectedErr {
-			t.Errorf("error mismatch: expected %v, got %v", test.expectedErr, err)
+			t.Errorf("%s: error mismatch: expected %v, got %v", test.name, test.expectedErr, err)
 		}
 
 		if !reflect.DeepEqual(test.object, test.expectedObj) {
-			t.Errorf("object mismatch: expected \n%v\ngot \n%v\n", test.expectedObj, test.object)
+			t.Errorf("%s: object mismatch: expected \n%#v\ngot \n%#v\n", test.name, test.expectedObj, test.object)
 		}
 	}
 }

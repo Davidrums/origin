@@ -6,7 +6,8 @@ import (
 	"time"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/util/sets"
 
 	buildapi "github.com/openshift/origin/pkg/build/api"
 )
@@ -15,7 +16,7 @@ func mockBuildConfig(namespace, name string) *buildapi.BuildConfig {
 	return &buildapi.BuildConfig{ObjectMeta: kapi.ObjectMeta{Namespace: namespace, Name: name}}
 }
 
-func withCreated(build *buildapi.Build, creationTimestamp util.Time) *buildapi.Build {
+func withCreated(build *buildapi.Build, creationTimestamp unversioned.Time) *buildapi.Build {
 	build.CreationTimestamp = creationTimestamp
 	return build
 }
@@ -67,8 +68,8 @@ func TestBuildByBuildConfigIndexFunc(t *testing.T) {
 
 func TestFilterBeforePredicate(t *testing.T) {
 	youngerThan := time.Hour
-	now := util.Now()
-	old := util.NewTime(now.Time.Add(-1 * youngerThan))
+	now := unversioned.Now()
+	old := unversioned.NewTime(now.Time.Add(-1 * youngerThan))
 	builds := []*buildapi.Build{
 		{
 			ObjectMeta: kapi.ObjectMeta{
@@ -162,7 +163,7 @@ func TestPopuldatedDataSet(t *testing.T) {
 			}
 		}
 	}
-	expectedNames := util.NewStringSet("build-1", "build-2")
+	expectedNames := sets.NewString("build-1", "build-2")
 	buildResults, err := dataSet.ListBuildsByBuildConfig(buildConfigs[0])
 	if err != nil {
 		t.Errorf("Unexpected result %v", err)

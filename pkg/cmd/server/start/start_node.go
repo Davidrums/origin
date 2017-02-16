@@ -5,15 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/coreos/go-systemd/daemon"
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 
-	"github.com/openshift/origin/pkg/cmd/server/kubernetes"
-	"github.com/openshift/origin/plugins/osdn/flatsdn"
-	"github.com/openshift/origin/plugins/osdn/multitenant"
 	kerrors "k8s.io/kubernetes/pkg/api/errors"
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 
@@ -21,70 +19,98 @@ import (
 	configapi "github.com/openshift/origin/pkg/cmd/server/api"
 	configapilatest "github.com/openshift/origin/pkg/cmd/server/api/latest"
 	"github.com/openshift/origin/pkg/cmd/server/api/validation"
+	"github.com/openshift/origin/pkg/cmd/server/crypto"
+	"github.com/openshift/origin/pkg/cmd/server/kubernetes"
+	"github.com/openshift/origin/pkg/cmd/templates"
+	cmdutil "github.com/openshift/origin/pkg/cmd/util"
 	"github.com/openshift/origin/pkg/cmd/util/docker"
+	utilflags "github.com/openshift/origin/pkg/cmd/util/flags"
+	sdnapi "github.com/openshift/origin/pkg/sdn/api"
 	"github.com/openshift/origin/pkg/version"
 )
 
 type NodeOptions struct {
-	NodeArgs *NodeArgs
+	NodeArgs   *NodeArgs
+	ExpireDays int
 
 	ConfigFile string
 	Output     io.Writer
 }
 
-const nodeLong = `
-Start a node
+var nodeLong = templates.LongDesc(`
+	Start a node
 
-This command helps you launch a node.  Running
+	This command helps you launch a node.  Running
 
-  $ %[1]s start node --master=<masterIP>
+	    %[1]s start node --config=<node-config>
 
-will start a node that attempts to connect to the master on the provided IP. The
-node will run in the foreground until you terminate the process.`
+	will start a node with given configuration file. The node will run in the
+	foreground until you terminate the process.`)
 
 // NewCommandStartNode provides a CLI handler for 'start node' command
-func NewCommandStartNode(basename string, out io.Writer) (*cobra.Command, *NodeOptions) {
-	options := &NodeOptions{Output: out}
+func NewCommandStartNode(basename string, out, errout io.Writer) (*cobra.Command, *NodeOptions) {
+	options := &NodeOptions{
+		ExpireDays: crypto.DefaultCertificateLifetimeInDays,
+		Output:     out,
+	}
 
 	cmd := &cobra.Command{
 		Use:   "node",
 		Short: "Launch a node",
 		Long:  fmt.Sprintf(nodeLong, basename),
 		Run: func(c *cobra.Command, args []string) {
-			if err := options.Complete(); err != nil {
-				fmt.Fprintln(c.Out(), kcmdutil.UsageError(c, err.Error()))
-				return
-			}
-			if err := options.Validate(args); err != nil {
-				fmt.Fprintln(c.Out(), kcmdutil.UsageError(c, err.Error()))
-				return
-			}
-
-			startProfiler()
-
-			if err := options.StartNode(); err != nil {
-				if kerrors.IsInvalid(err) {
-					if details := err.(*kerrors.StatusError).ErrStatus.Details; details != nil {
-						fmt.Fprintf(c.Out(), "Invalid %s %s\n", details.Kind, details.Name)
-						for _, cause := range details.Causes {
-							fmt.Fprintf(c.Out(), "  %s: %s\n", cause.Field, cause.Message)
-						}
-						os.Exit(255)
-					}
-				}
-				glog.Fatal(err)
-			}
+			options.Run(c, errout, args)
 		},
 	}
 
 	flags := cmd.Flags()
 
 	flags.StringVar(&options.ConfigFile, "config", "", "Location of the node configuration file to run from. When running from a configuration file, all other command-line arguments are ignored.")
+	flags.IntVar(&options.ExpireDays, "expire-days", options.ExpireDays, "Validity of the certificates in days (defaults to 2 years). WARNING: extending this above default value is highly discouraged.")
 
 	options.NodeArgs = NewDefaultNodeArgs()
-
-	BindNodeArgs(options.NodeArgs, flags, "")
+	BindNodeArgs(options.NodeArgs, flags, "", true)
 	BindListenArg(options.NodeArgs.ListenArg, flags, "")
+	BindImageFormatArgs(options.NodeArgs.ImageFormatArgs, flags, "")
+	BindKubeConnectionArgs(options.NodeArgs.KubeConnectionArgs, flags, "")
+
+	flags.BoolVar(&options.NodeArgs.Bootstrap, "bootstrap", false, "Use the provided .kubeconfig file to perform initial node setup (experimental).")
+
+	// autocompletion hints
+	cmd.MarkFlagFilename("config", "yaml", "yml")
+
+	return cmd, options
+}
+
+var networkLong = templates.LongDesc(`
+	Start node network components
+
+	This command helps you launch node networking.  Running
+
+	    %[1]s start network --config=<node-config>
+
+	will start the network proxy and SDN plugins with given configuration file. The proxy will
+	run in the foreground until you terminate the process.`)
+
+// NewCommandStartNetwork provides a CLI handler for 'start network' command
+func NewCommandStartNetwork(basename string, out, errout io.Writer) (*cobra.Command, *NodeOptions) {
+	options := &NodeOptions{Output: out}
+
+	cmd := &cobra.Command{
+		Use:   "network",
+		Short: "Launch node network",
+		Long:  fmt.Sprintf(networkLong, basename),
+		Run: func(c *cobra.Command, args []string) {
+			options.Run(c, errout, args)
+		},
+	}
+
+	flags := cmd.Flags()
+	flags.StringVar(&options.ConfigFile, "config", "", "Location of the node configuration file to run from. When running from a configuration file, all other command-line arguments are ignored.")
+
+	options.NodeArgs = NewDefaultNodeArgs()
+	options.NodeArgs.Components = NewNetworkComponentFlag()
+	BindNodeNetworkArgs(options.NodeArgs, flags, "")
 	BindImageFormatArgs(options.NodeArgs.ImageFormatArgs, flags, "")
 	BindKubeConnectionArgs(options.NodeArgs.KubeConnectionArgs, flags, "")
 
@@ -94,9 +120,33 @@ func NewCommandStartNode(basename string, out io.Writer) (*cobra.Command, *NodeO
 	return cmd, options
 }
 
+func (options *NodeOptions) Run(c *cobra.Command, errout io.Writer, args []string) {
+	kcmdutil.CheckErr(options.Complete())
+	kcmdutil.CheckErr(options.Validate(args))
+
+	startProfiler()
+
+	if err := options.StartNode(); err != nil {
+		if kerrors.IsInvalid(err) {
+			if details := err.(*kerrors.StatusError).ErrStatus.Details; details != nil {
+				fmt.Fprintf(errout, "Invalid %s %s\n", details.Kind, details.Name)
+				for _, cause := range details.Causes {
+					fmt.Fprintf(errout, "  %s: %s\n", cause.Field, cause.Message)
+				}
+				os.Exit(255)
+			}
+		}
+		glog.Fatal(err)
+	}
+}
+
 func (o NodeOptions) Validate(args []string) error {
 	if len(args) != 0 {
 		return errors.New("no arguments are supported for start node")
+	}
+
+	if o.ExpireDays < 0 {
+		return errors.New("expire-days must be valid number of days")
 	}
 
 	if o.IsWriteConfigOnly() {
@@ -105,8 +155,8 @@ func (o NodeOptions) Validate(args []string) error {
 		}
 	}
 
-	// if we are not starting up using a config file, run the argument validation
-	if !o.IsRunFromConfig() {
+	// if we are starting up using a config file, run no validations here
+	if o.NodeArgs.Bootstrap && !o.IsRunFromConfig() {
 		if err := o.NodeArgs.Validate(); err != nil {
 			return err
 		}
@@ -141,94 +191,130 @@ func (o NodeOptions) StartNode() error {
 // 3.  Writes the fully specified node config and exits if needed
 // 4.  Starts the node based on the fully specified config
 func (o NodeOptions) RunNode() error {
-	if !o.IsRunFromConfig() || o.IsWriteConfigOnly() {
-		glog.V(2).Infof("Generating node configuration")
-		if err := o.CreateNodeConfig(); err != nil {
-			return err
+	nodeConfig, configFile, err := o.resolveNodeConfig()
+	if err != nil {
+		return err
+	}
+
+	validationResults := validation.ValidateNodeConfig(nodeConfig, nil)
+	if len(validationResults.Warnings) != 0 {
+		for _, warning := range validationResults.Warnings {
+			glog.Warningf("Warning: %v, node start will continue.", warning)
 		}
+	}
+	if len(validationResults.Errors) != 0 {
+		glog.V(4).Infof("Configuration is invalid: %#v", nodeConfig)
+		return kerrors.NewInvalid(configapi.Kind("NodeConfig"), configFile, validationResults.Errors)
+	}
+
+	if err := ValidateRuntime(nodeConfig, o.NodeArgs.Components); err != nil {
+		return err
 	}
 
 	if o.IsWriteConfigOnly() {
 		return nil
 	}
 
-	var nodeConfig *configapi.NodeConfig
-	var err error
-	if o.IsRunFromConfig() {
-		nodeConfig, err = configapilatest.ReadAndResolveNodeConfig(o.ConfigFile)
-	} else {
-		nodeConfig, err = o.NodeArgs.BuildSerializeableNodeConfig()
-	}
-	if err != nil {
-		return err
-	}
-
-	errs := validation.ValidateNodeConfig(nodeConfig)
-	if len(errs) != 0 {
-		return kerrors.NewInvalid("NodeConfig", o.ConfigFile, errs)
-	}
-
-	_, kubeClientConfig, err := configapi.GetKubeClient(nodeConfig.MasterKubeConfig)
-	if err != nil {
-		return err
-	}
-	glog.Infof("Starting a node connected to %s", kubeClientConfig.Host)
-
-	if err := StartNode(*nodeConfig); err != nil {
+	if err := StartNode(*nodeConfig, o.NodeArgs.Components); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (o NodeOptions) CreateNodeConfig() error {
-	getSignerOptions := &admin.SignerCertOptions{
-		CertFile:   admin.DefaultCertFilename(o.NodeArgs.MasterCertDir, "ca"),
-		KeyFile:    admin.DefaultKeyFilename(o.NodeArgs.MasterCertDir, "ca"),
-		SerialFile: admin.DefaultSerialFilename(o.NodeArgs.MasterCertDir, "ca"),
-	}
+// resolveNodeConfig creates a new configuration on disk by reading from the master, reads
+// the config file from disk if specified, or generates a new config from the incoming arguments.
+// After this call returns without an error, config files will exist on disk. It also returns
+// a string for messages indicating which config file contains the config.
+func (o NodeOptions) resolveNodeConfig() (*configapi.NodeConfig, string, error) {
+	switch {
+	case o.NodeArgs.Bootstrap:
+		glog.V(2).Infof("Bootstrapping from master configuration")
 
+		hostnames, err := o.NodeArgs.GetServerCertHostnames()
+		if err != nil {
+			return nil, "", err
+		}
+		nodeConfigDir := o.NodeArgs.ConfigDir.Value()
+		if err := o.loadBootstrap(hostnames.List(), nodeConfigDir); err != nil {
+			return nil, "", err
+		}
+		configFile := o.ConfigFile
+		if len(configFile) == 0 {
+			configFile = filepath.Join(o.NodeArgs.ConfigDir.Value(), "node-config.yaml")
+		}
+		cfg, err := configapilatest.ReadAndResolveNodeConfig(configFile)
+		return cfg, configFile, err
+
+	case o.IsRunFromConfig():
+		glog.V(2).Infof("Reading node configuration from %s", o.ConfigFile)
+		cfg, err := configapilatest.ReadAndResolveNodeConfig(o.ConfigFile)
+		return cfg, o.ConfigFile, err
+
+	default:
+		glog.V(2).Infof("Generating new node configuration")
+		configFile, err := o.createNodeConfig()
+		if err != nil {
+			return nil, "", err
+		}
+		cfg, err := o.NodeArgs.BuildSerializeableNodeConfig()
+		return cfg, configFile, err
+	}
+}
+
+// createNodeConfig writes the appropriate config file to the ConfigDir location and then
+// returns the path to that config file or an error.
+func (o NodeOptions) createNodeConfig() (string, error) {
+	hostnames, err := o.NodeArgs.GetServerCertHostnames()
+	if err != nil {
+		return "", err
+	}
+	nodeConfigDir := o.NodeArgs.ConfigDir.Value()
 	var dnsIP string
 	if len(o.NodeArgs.ClusterDNS) > 0 {
 		dnsIP = o.NodeArgs.ClusterDNS.String()
 	}
-
 	masterAddr, err := o.NodeArgs.KubeConnectionArgs.GetKubernetesAddress(o.NodeArgs.DefaultKubernetesURL)
 	if err != nil {
-		return err
+		return "", err
+	}
+	if masterAddr == nil {
+		return "", errors.New("--kubeconfig must be set to provide API server connection information")
 	}
 
-	nodeConfigDir := o.NodeArgs.ConfigDir.Value()
+	getSignerOptions := &admin.SignerCertOptions{
+		CertFile:   admin.DefaultCertFilename(o.NodeArgs.MasterCertDir, admin.CAFilePrefix),
+		KeyFile:    admin.DefaultKeyFilename(o.NodeArgs.MasterCertDir, admin.CAFilePrefix),
+		SerialFile: admin.DefaultSerialFilename(o.NodeArgs.MasterCertDir, admin.CAFilePrefix),
+	}
 	createNodeConfigOptions := admin.CreateNodeConfigOptions{
 		SignerCertOptions: getSignerOptions,
 
 		NodeConfigDir: nodeConfigDir,
 
 		NodeName:            o.NodeArgs.NodeName,
-		Hostnames:           []string{o.NodeArgs.NodeName},
+		Hostnames:           hostnames.List(),
 		VolumeDir:           o.NodeArgs.VolumeDir,
 		ImageTemplate:       o.NodeArgs.ImageFormatArgs.ImageTemplate,
 		AllowDisabledDocker: o.NodeArgs.AllowDisabledDocker,
+		DNSBindAddress:      o.NodeArgs.DNSBindAddr,
 		DNSDomain:           o.NodeArgs.ClusterDomain,
 		DNSIP:               dnsIP,
 		ListenAddr:          o.NodeArgs.ListenArg.ListenAddr,
 		NetworkPluginName:   o.NodeArgs.NetworkPluginName,
 
-		APIServerURL:    masterAddr.String(),
-		APIServerCAFile: getSignerOptions.CertFile,
+		APIServerURL:     masterAddr.String(),
+		APIServerCAFiles: []string{admin.DefaultCABundleFile(o.NodeArgs.MasterCertDir)},
 
 		NodeClientCAFile: getSignerOptions.CertFile,
-		Output:           o.Output,
+		ExpireDays:       o.ExpireDays,
+		Output:           cmdutil.NewGLogWriterV(3),
 	}
 
 	if err := createNodeConfigOptions.Validate(nil); err != nil {
-		return err
+		return "", err
 	}
-	if err := createNodeConfigOptions.CreateNodeFolder(); err != nil {
-		return err
-	}
-
-	return nil
+	return createNodeConfigOptions.CreateNodeFolder()
 }
 
 func (o NodeOptions) IsWriteConfigOnly() bool {
@@ -239,38 +325,54 @@ func (o NodeOptions) IsRunFromConfig() bool {
 	return (len(o.ConfigFile) > 0)
 }
 
-func RunSDNController(config *kubernetes.NodeConfig, nodeConfig configapi.NodeConfig) {
-	oclient, _, err := configapi.GetOpenShiftClient(nodeConfig.MasterKubeConfig)
-	if err != nil {
-		glog.Fatal("Failed to get kube client for SDN")
-	}
-
-	switch nodeConfig.NetworkConfig.NetworkPluginName {
-	case flatsdn.NetworkPluginName():
-		ch := make(chan struct{})
-		config.KubeletConfig.StartUpdates = ch
-		go flatsdn.Node(oclient, config.Client, nodeConfig.NodeName, "", ch, nodeConfig.NetworkConfig.MTU)
-	case multitenant.NetworkPluginName():
-		ch := make(chan struct{})
-		config.KubeletConfig.StartUpdates = ch
-		plugin := multitenant.GetKubeNetworkPlugin()
-		config.KubeletConfig.NetworkPlugins = append(config.KubeletConfig.NetworkPlugins, plugin)
-		go multitenant.Node(oclient, config.Client, nodeConfig.NodeName, "", ch, plugin, nodeConfig.NetworkConfig.MTU)
-	}
-}
-
-func StartNode(nodeConfig configapi.NodeConfig) error {
-	config, err := kubernetes.BuildKubernetesNodeConfig(nodeConfig)
+func StartNode(nodeConfig configapi.NodeConfig, components *utilflags.ComponentFlag) error {
+	config, err := kubernetes.BuildKubernetesNodeConfig(nodeConfig, components.Enabled(ComponentProxy), components.Enabled(ComponentDNS) && len(nodeConfig.DNSBindAddress) > 0)
 	if err != nil {
 		return err
 	}
-	glog.Infof("Starting node %s (%s)", config.KubeletServer.HostnameOverride, version.Get().String())
 
-	RunSDNController(config, nodeConfig)
-	config.EnsureVolumeDir()
-	config.EnsureDocker(docker.NewHelper())
-	config.RunProxy()
-	config.RunKubelet()
+	if sdnapi.IsOpenShiftNetworkPlugin(config.KubeletServer.NetworkPluginName) {
+		// TODO: SDN plugin depends on the Kubelet registering as a Node and doesn't retry cleanly,
+		// and Kubelet also can't start the PodSync loop until the SDN plugin has loaded.
+		if components.Enabled(ComponentKubelet) != components.Enabled(ComponentPlugins) {
+			return fmt.Errorf("the SDN plugin must be run in the same process as the kubelet")
+		}
+	}
+
+	if components.Enabled(ComponentKubelet) {
+		glog.Infof("Starting node %s (%s)", config.KubeletServer.HostnameOverride, version.Get().String())
+	} else {
+		glog.Infof("Starting node networking %s (%s)", config.KubeletServer.HostnameOverride, version.Get().String())
+	}
+
+	_, kubeClientConfig, err := configapi.GetKubeClient(nodeConfig.MasterKubeConfig, nodeConfig.MasterClientConnectionOverrides)
+	if err != nil {
+		return err
+	}
+	glog.Infof("Connecting to API server %s", kubeClientConfig.Host)
+
+	// preconditions
+	if components.Enabled(ComponentKubelet) {
+		config.EnsureKubeletAccess()
+		config.EnsureVolumeDir()
+		config.EnsureDocker(docker.NewHelper())
+		config.EnsureLocalQuota(nodeConfig) // must be performed after EnsureVolumeDir
+	}
+
+	if components.Enabled(ComponentKubelet) {
+		config.RunKubelet()
+	}
+	if components.Enabled(ComponentPlugins) {
+		config.RunPlugin()
+	}
+	if components.Enabled(ComponentProxy) {
+		config.RunProxy()
+	}
+	if components.Enabled(ComponentDNS) && config.DNSServer != nil {
+		config.RunDNS()
+	}
+
+	config.RunServiceStores(components.Enabled(ComponentProxy), components.Enabled(ComponentDNS))
 
 	return nil
 }

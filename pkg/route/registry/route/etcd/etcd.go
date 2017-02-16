@@ -2,47 +2,63 @@ package etcd
 
 import (
 	kapi "k8s.io/kubernetes/pkg/api"
+	kapirest "k8s.io/kubernetes/pkg/api/rest"
 	"k8s.io/kubernetes/pkg/fields"
 	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/registry/generic"
-	etcdgeneric "k8s.io/kubernetes/pkg/registry/generic/etcd"
+	"k8s.io/kubernetes/pkg/registry/generic/registry"
 	"k8s.io/kubernetes/pkg/runtime"
 	"k8s.io/kubernetes/pkg/storage"
 
 	"github.com/openshift/origin/pkg/route"
 	"github.com/openshift/origin/pkg/route/api"
 	rest "github.com/openshift/origin/pkg/route/registry/route"
+	"github.com/openshift/origin/pkg/util/restoptions"
 )
 
 type REST struct {
-	*etcdgeneric.Etcd
+	*registry.Store
 }
 
 // NewREST returns a RESTStorage object that will work against routes.
-func NewREST(s storage.Interface, allocator route.RouteAllocator) *REST {
+func NewREST(optsGetter restoptions.Getter, allocator route.RouteAllocator) (*REST, *StatusREST, error) {
 	strategy := rest.NewStrategy(allocator)
-	prefix := "/routes"
-	store := &etcdgeneric.Etcd{
+
+	store := &registry.Store{
 		NewFunc:     func() runtime.Object { return &api.Route{} },
 		NewListFunc: func() runtime.Object { return &api.RouteList{} },
-		KeyRootFunc: func(ctx kapi.Context) string {
-			return etcdgeneric.NamespaceKeyRootFunc(ctx, prefix)
-		},
-		KeyFunc: func(ctx kapi.Context, id string) (string, error) {
-			return etcdgeneric.NamespaceKeyFunc(ctx, prefix, id)
-		},
 		ObjectNameFunc: func(obj runtime.Object) (string, error) {
 			return obj.(*api.Route).Name, nil
 		},
-		PredicateFunc: func(label labels.Selector, field fields.Selector) generic.Matcher {
-			return rest.MatchRoute(label, field)
+		PredicateFunc: func(label labels.Selector, field fields.Selector) storage.SelectionPredicate {
+			return rest.Matcher(label, field)
 		},
-		EndpointName: "routes",
+		QualifiedResource: api.Resource("routes"),
 
 		CreateStrategy: strategy,
 		UpdateStrategy: strategy,
-
-		Storage: s,
 	}
-	return &REST{store}
+
+	if err := restoptions.ApplyOptions(optsGetter, store, true, storage.NoTriggerPublisher); err != nil {
+		return nil, nil, err
+	}
+
+	statusStore := *store
+	statusStore.UpdateStrategy = rest.StatusStrategy
+
+	return &REST{store}, &StatusREST{&statusStore}, nil
+}
+
+// StatusREST implements the REST endpoint for changing the status of a route.
+type StatusREST struct {
+	store *registry.Store
+}
+
+// New creates a new route resource
+func (r *StatusREST) New() runtime.Object {
+	return &api.Route{}
+}
+
+// Update alters the status subset of an object.
+func (r *StatusREST) Update(ctx kapi.Context, name string, objInfo kapirest.UpdatedObjectInfo) (runtime.Object, bool, error) {
+	return r.store.Update(ctx, name, objInfo)
 }

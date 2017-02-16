@@ -3,31 +3,33 @@ package cmd
 import (
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/golang/glog"
 	"github.com/spf13/pflag"
 
 	kapi "k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/registry/core/controller"
+	"k8s.io/kubernetes/pkg/registry/core/endpoint"
+	"k8s.io/kubernetes/pkg/registry/core/namespace"
+	"k8s.io/kubernetes/pkg/registry/core/node"
+	"k8s.io/kubernetes/pkg/registry/core/persistentvolume"
+	"k8s.io/kubernetes/pkg/registry/core/persistentvolumeclaim"
+	"k8s.io/kubernetes/pkg/registry/core/pod"
+	"k8s.io/kubernetes/pkg/registry/core/resourcequota"
+	"k8s.io/kubernetes/pkg/registry/core/secret"
+	"k8s.io/kubernetes/pkg/registry/core/serviceaccount"
 	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util"
-
-	"k8s.io/kubernetes/pkg/registry/controller"
-	"k8s.io/kubernetes/pkg/registry/endpoint"
-	"k8s.io/kubernetes/pkg/registry/minion"
-	"k8s.io/kubernetes/pkg/registry/namespace"
-	"k8s.io/kubernetes/pkg/registry/persistentvolume"
-	"k8s.io/kubernetes/pkg/registry/persistentvolumeclaim"
-	"k8s.io/kubernetes/pkg/registry/pod"
-	"k8s.io/kubernetes/pkg/registry/resourcequota"
-	"k8s.io/kubernetes/pkg/registry/secret"
-	"k8s.io/kubernetes/pkg/registry/serviceaccount"
 
 	buildapi "github.com/openshift/origin/pkg/build/api"
 	buildrest "github.com/openshift/origin/pkg/build/registry/build"
 	buildconfigrest "github.com/openshift/origin/pkg/build/registry/buildconfig"
 	deployapi "github.com/openshift/origin/pkg/deploy/api"
+	deployrest "github.com/openshift/origin/pkg/deploy/registry/deployconfig"
 	imageapi "github.com/openshift/origin/pkg/image/api"
 	routeapi "github.com/openshift/origin/pkg/route/api"
+	osautil "github.com/openshift/origin/pkg/serviceaccounts/util"
 )
 
 var ErrExportOmit = fmt.Errorf("object is omitted")
@@ -37,9 +39,9 @@ type Exporter interface {
 	Export(obj runtime.Object, exact bool) error
 }
 
-type defaultExporter struct{}
+type DefaultExporter struct{}
 
-func (e *defaultExporter) AddExportOptions(flags *pflag.FlagSet) {
+func (e *DefaultExporter) AddExportOptions(flags *pflag.FlagSet) {
 }
 
 func exportObjectMeta(objMeta *kapi.ObjectMeta, exact bool) {
@@ -47,7 +49,7 @@ func exportObjectMeta(objMeta *kapi.ObjectMeta, exact bool) {
 	if !exact {
 		objMeta.Namespace = ""
 	}
-	objMeta.CreationTimestamp = util.Time{}
+	objMeta.CreationTimestamp = unversioned.Time{}
 	objMeta.DeletionTimestamp = nil
 	objMeta.ResourceVersion = ""
 	objMeta.SelfLink = ""
@@ -56,22 +58,24 @@ func exportObjectMeta(objMeta *kapi.ObjectMeta, exact bool) {
 	}
 }
 
-func (e *defaultExporter) Export(obj runtime.Object, exact bool) error {
+func (e *DefaultExporter) Export(obj runtime.Object, exact bool) error {
 	if meta, err := kapi.ObjectMetaFor(obj); err == nil {
 		exportObjectMeta(meta, exact)
 	} else {
 		glog.V(4).Infof("Object of type %v does not have ObjectMeta: %v", reflect.TypeOf(obj), err)
 	}
+	ctx := kapi.NewContext()
+
 	switch t := obj.(type) {
 	case *kapi.Endpoints:
-		endpoint.Strategy.PrepareForCreate(obj)
+		endpoint.Strategy.PrepareForCreate(ctx, obj)
 	case *kapi.ResourceQuota:
-		resourcequota.Strategy.PrepareForCreate(obj)
+		resourcequota.Strategy.PrepareForCreate(ctx, obj)
 	case *kapi.LimitRange:
 	// TODO: this needs to be fixed
 	//  limitrange.Strategy.PrepareForCreate(obj)
 	case *kapi.Node:
-		minion.Strategy.PrepareForCreate(obj)
+		node.Strategy.PrepareForCreate(ctx, obj)
 		if exact {
 			return nil
 		}
@@ -79,15 +83,15 @@ func (e *defaultExporter) Export(obj runtime.Object, exact bool) error {
 		// we clear that without exact so that the node value can be reused.
 		t.Status = kapi.NodeStatus{}
 	case *kapi.Namespace:
-		namespace.Strategy.PrepareForCreate(obj)
+		namespace.Strategy.PrepareForCreate(ctx, obj)
 	case *kapi.PersistentVolumeClaim:
-		persistentvolumeclaim.Strategy.PrepareForCreate(obj)
+		persistentvolumeclaim.Strategy.PrepareForCreate(ctx, obj)
 	case *kapi.PersistentVolume:
-		persistentvolume.Strategy.PrepareForCreate(obj)
+		persistentvolume.Strategy.PrepareForCreate(ctx, obj)
 	case *kapi.ReplicationController:
-		controller.Strategy.PrepareForCreate(obj)
+		controller.Strategy.PrepareForCreate(ctx, obj)
 	case *kapi.Pod:
-		pod.Strategy.PrepareForCreate(obj)
+		pod.Strategy.PrepareForCreate(ctx, obj)
 	case *kapi.PodTemplate:
 	case *kapi.Service:
 		// TODO: service does not yet have a strategy
@@ -104,7 +108,7 @@ func (e *defaultExporter) Export(obj runtime.Object, exact bool) error {
 			}
 		}
 	case *kapi.Secret:
-		secret.Strategy.PrepareForCreate(obj)
+		secret.Strategy.PrepareForCreate(ctx, obj)
 		if exact {
 			return nil
 		}
@@ -113,19 +117,37 @@ func (e *defaultExporter) Export(obj runtime.Object, exact bool) error {
 			return ErrExportOmit
 		}
 	case *kapi.ServiceAccount:
-		serviceaccount.Strategy.PrepareForCreate(obj)
+		serviceaccount.Strategy.PrepareForCreate(ctx, obj)
+		if exact {
+			return nil
+		}
+
+		dockercfgSecretPrefix := osautil.GetDockercfgSecretNamePrefix(t)
+		newImagePullSecrets := []kapi.LocalObjectReference{}
+		for _, secretRef := range t.ImagePullSecrets {
+			if strings.HasPrefix(secretRef.Name, dockercfgSecretPrefix) {
+				continue
+			}
+			newImagePullSecrets = append(newImagePullSecrets, secretRef)
+		}
+		t.ImagePullSecrets = newImagePullSecrets
+
+		tokenSecretPrefix := osautil.GetTokenSecretNamePrefix(t)
+		newMountableSecrets := []kapi.ObjectReference{}
+		for _, secretRef := range t.Secrets {
+			if strings.HasPrefix(secretRef.Name, dockercfgSecretPrefix) ||
+				strings.HasPrefix(secretRef.Name, tokenSecretPrefix) {
+				continue
+			}
+			newMountableSecrets = append(newMountableSecrets, secretRef)
+		}
+		t.Secrets = newMountableSecrets
 
 	case *deployapi.DeploymentConfig:
-		// TODO: when internal refactor is completed use status reset
-		t.LatestVersion = 0
-		t.Details = nil
-		for i := range t.Triggers {
-			if p := t.Triggers[i].ImageChangeParams; p != nil {
-				p.LastTriggeredImage = ""
-			}
-		}
+		return deployrest.Strategy.Export(ctx, obj, exact)
+
 	case *buildapi.BuildConfig:
-		buildconfigrest.Strategy.PrepareForCreate(obj)
+		buildconfigrest.Strategy.PrepareForCreate(ctx, obj)
 		// TODO: should be handled by prepare for create
 		t.Status.LastVersion = 0
 		for i := range t.Spec.Triggers {
@@ -134,7 +156,7 @@ func (e *defaultExporter) Export(obj runtime.Object, exact bool) error {
 			}
 		}
 	case *buildapi.Build:
-		buildrest.Strategy.PrepareForCreate(obj)
+		buildrest.Strategy.PrepareForCreate(ctx, obj)
 		// TODO: should be handled by prepare for create
 		t.Status.Duration = 0
 		t.Status.Phase = buildapi.BuildPhaseNew

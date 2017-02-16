@@ -7,7 +7,7 @@ import (
 
 	"k8s.io/kubernetes/pkg/api/meta"
 	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/fielderrors"
+	"k8s.io/kubernetes/pkg/util/validation/field"
 
 	"github.com/openshift/origin/pkg/template/api"
 	. "github.com/openshift/origin/pkg/template/generator"
@@ -15,7 +15,11 @@ import (
 	"github.com/openshift/origin/pkg/util/stringreplace"
 )
 
-var parameterExp = regexp.MustCompile(`\$\{([a-zA-Z0-9\_]+)\}`)
+// match ${KEY}, KEY will be grouped
+var stringParameterExp = regexp.MustCompile(`\$\{([a-zA-Z0-9\_]+?)\}`)
+
+// match ${{KEY}} exact match only, KEY will be grouped
+var nonStringParameterExp = regexp.MustCompile(`^\$\{\{([a-zA-Z0-9\_]+)\}\}$`)
 
 // Processor process the Template into the List with substituted parameters
 type Processor struct {
@@ -31,27 +35,39 @@ func NewProcessor(generators map[string]Generator) *Processor {
 // Parameter values using the defined set of generators first, and then it
 // substitutes all Parameter expression occurrences with their corresponding
 // values (currently in the containers' Environment variables only).
-func (p *Processor) Process(template *api.Template) fielderrors.ValidationErrorList {
-	templateErrors := fielderrors.ValidationErrorList{}
+func (p *Processor) Process(template *api.Template) field.ErrorList {
+	templateErrors := field.ErrorList{}
 
-	if err := p.GenerateParameterValues(template); err != nil {
-		return append(templateErrors.Prefix("Template"), fielderrors.NewFieldInvalid("parameters", err, "failure to generate parameter value"))
+	if fieldError := p.GenerateParameterValues(template); fieldError != nil {
+		return append(templateErrors, fieldError)
 	}
 
+	// Place parameters into a map for efficient lookup
+	paramMap := make(map[string]api.Parameter)
+	for _, param := range template.Parameters {
+		paramMap[param.Name] = param
+	}
+
+	// Perform parameter substitution on the template's user message. This can be used to
+	// instruct a user on next steps for the template.
+	template.Message, _ = p.EvaluateParameterSubstitution(paramMap, template.Message)
+
+	itemPath := field.NewPath("item")
 	for i, item := range template.Objects {
+		idxPath := itemPath.Index(i)
 		if obj, ok := item.(*runtime.Unknown); ok {
 			// TODO: use runtime.DecodeList when it returns ValidationErrorList
-			obj, err := runtime.UnstructuredJSONScheme.Decode(obj.RawJSON)
+			decodedObj, err := runtime.Decode(runtime.UnstructuredJSONScheme, obj.Raw)
 			if err != nil {
-				util.ReportError(&templateErrors, i, *fielderrors.NewFieldInvalid("objects", err, "unable to handle object"))
+				templateErrors = append(templateErrors, field.Invalid(idxPath.Child("objects"), obj, fmt.Sprintf("unable to handle object: %v", err)))
 				continue
 			}
-			item = obj
+			item = decodedObj
 		}
 
-		newItem, err := p.SubstituteParameters(template.Parameters, item)
+		newItem, err := p.SubstituteParameters(paramMap, item)
 		if err != nil {
-			util.ReportError(&templateErrors, i, *fielderrors.NewFieldInvalid("parameters", template.Parameters, err.Error()))
+			templateErrors = append(templateErrors, field.Invalid(idxPath.Child("parameters"), template.Parameters, err.Error()))
 		}
 		// If an object definition's metadata includes a namespace field, the field will be stripped out of
 		// the definition during template instantiation.  This is necessary because all objects created during
@@ -59,7 +75,8 @@ func (p *Processor) Process(template *api.Template) fielderrors.ValidationErrorL
 		//a different namespace.
 		stripNamespace(newItem)
 		if err := util.AddObjectLabels(newItem, template.ObjectLabels); err != nil {
-			util.ReportError(&templateErrors, i, *fielderrors.NewFieldInvalid("labels", err, "label could not be applied"))
+			templateErrors = append(templateErrors, field.Invalid(idxPath.Child("labels"),
+				template.ObjectLabels, fmt.Sprintf("label could not be applied: %v", err)))
 		}
 		template.Objects[i] = newItem
 	}
@@ -69,7 +86,7 @@ func (p *Processor) Process(template *api.Template) fielderrors.ValidationErrorL
 
 func stripNamespace(obj runtime.Object) {
 	// Remove namespace from the item
-	if itemMeta, err := meta.Accessor(obj); err == nil {
+	if itemMeta, err := meta.Accessor(obj); err == nil && len(itemMeta.GetNamespace()) > 0 {
 		itemMeta.SetNamespace("")
 		return
 	}
@@ -111,30 +128,49 @@ func GetParameterByName(t *api.Template, name string) *api.Parameter {
 	return nil
 }
 
+// EvaluateParameterSubstitution replaces escaped parameters in a string with values from the
+// provided map.  Returns the substituted value (if any substitution applied) and a boolean
+// indicating if the resulting value should be treated as a string(true) or a non-string
+// value(false) for purposes of json encoding.
+func (p *Processor) EvaluateParameterSubstitution(params map[string]api.Parameter, in string) (string, bool) {
+	out := in
+	// First check if the value matches the "${{KEY}}" substitution syntax, which
+	// means replace and drop the quotes because the parameter value is to be used
+	// as a non-string value.  If we hit a match here, we're done because the
+	// "${{KEY}}" syntax is exact match only, it cannot be used in a value like
+	// "FOO_${{KEY}}_BAR", no substitution will be performed if it is used in that way.
+	for _, match := range nonStringParameterExp.FindAllStringSubmatch(in, -1) {
+		if len(match) > 1 {
+			if paramValue, found := params[match[1]]; found {
+				out = strings.Replace(out, match[0], paramValue.Value, 1)
+				return out, false
+			}
+		}
+	}
+
+	// If we didn't do a non-string substitution above, do normal string substitution
+	// on the value here if it contains a "${KEY}" reference.  This substitution does
+	// allow multiple matches and prefix/postfix, eg "FOO_${KEY1}_${KEY2}_BAR"
+	for _, match := range stringParameterExp.FindAllStringSubmatch(in, -1) {
+		if len(match) > 1 {
+			if paramValue, found := params[match[1]]; found {
+				out = strings.Replace(out, match[0], paramValue.Value, 1)
+			}
+		}
+	}
+	return out, true
+}
+
 // SubstituteParameters loops over all values defined in structured
 // and unstructured types that are children of item.
 //
 // Example of Parameter expression:
 //   - ${PARAMETER_NAME}
 //
-func (p *Processor) SubstituteParameters(params []api.Parameter, item runtime.Object) (runtime.Object, error) {
-	// Make searching for given parameter name/value more effective
-	paramMap := make(map[string]string, len(params))
-	for _, param := range params {
-		paramMap[param.Name] = param.Value
-	}
-
-	stringreplace.VisitObjectStrings(item, func(in string) string {
-		for _, match := range parameterExp.FindAllStringSubmatch(in, -1) {
-			if len(match) > 1 {
-				if paramValue, found := paramMap[match[1]]; found {
-					in = strings.Replace(in, match[0], paramValue, 1)
-				}
-			}
-		}
-		return in
+func (p *Processor) SubstituteParameters(params map[string]api.Parameter, item runtime.Object) (runtime.Object, error) {
+	stringreplace.VisitObjectStrings(item, func(in string) (string, bool) {
+		return p.EvaluateParameterSubstitution(params, in)
 	})
-
 	return item, nil
 }
 
@@ -150,33 +186,37 @@ func (p *Processor) SubstituteParameters(params []api.Parameter, item runtime.Ob
 // "[0-1]{8}"       | "01001100"
 // "0x[A-F0-9]{4}"  | "0xB3AF"
 // "[a-zA-Z0-9]{8}" | "hW4yQU5i"
-func (p *Processor) GenerateParameterValues(t *api.Template) error {
+// If an error occurs, the parameter that caused the error is returned along with the error message.
+func (p *Processor) GenerateParameterValues(t *api.Template) *field.Error {
 	for i := range t.Parameters {
 		param := &t.Parameters[i]
 		if len(param.Value) > 0 {
 			continue
 		}
+		templatePath := field.NewPath("template").Child("parameters").Index(i)
 		if param.Generate != "" {
 			generator, ok := p.Generators[param.Generate]
 			if !ok {
-				return fmt.Errorf("template.parameters[%v]: Unable to find the '%v' generator", i, param.Generate)
+				err := fmt.Errorf("Unknown generator name '%v' for parameter %s", param.Generate, param.Name)
+				return field.Invalid(templatePath, param.Generate, err.Error())
 			}
 			if generator == nil {
-				return fmt.Errorf("template.parameters[%v]: Invalid '%v' generator", i, param.Generate)
+				err := fmt.Errorf("template.parameters[%v]: Invalid '%v' generator for parameter %s", i, param.Generate, param.Name)
+				return field.Invalid(templatePath, param, err.Error())
 			}
 			value, err := generator.GenerateValue(param.From)
 			if err != nil {
-				return err
+				return field.Invalid(templatePath, param, err.Error())
 			}
 			param.Value, ok = value.(string)
 			if !ok {
-				return fmt.Errorf("template.parameters[%v]: Unable to convert the generated value '%#v' to string", i, value)
+				err := fmt.Errorf("template.parameters[%v]: Unable to convert the generated value '%#v' to string for parameter %s", i, value, param.Name)
+				return field.Invalid(templatePath, param, err.Error())
 			}
 		}
 		if len(param.Value) == 0 && param.Required {
-			err := fielderrors.NewFieldRequired(fmt.Sprintf("parameters[%d].value", i))
-			err.Detail = fmt.Sprintf("parameter %s is required and must be specified", param.Name)
-			return err
+			err := fmt.Errorf("template.parameters[%v]: parameter %s is required and must be specified", i, param.Name)
+			return field.Required(templatePath, err.Error())
 		}
 	}
 	return nil

@@ -55,12 +55,18 @@ func TestNewIPFailoverConfiguratorPlugin(t *testing.T) {
 			ErrorExpectation: false,
 		},
 		{
+			Name:             "vrid-base",
+			Options:          &ipfailover.IPFailoverConfigCmdOptions{VRRPIDOffset: 30},
+			ErrorExpectation: false,
+		},
+		{
 			Name: "all-options",
 			Options: &ipfailover.IPFailoverConfigCmdOptions{
 				Selector:         "ipf=v1",
 				VirtualIPs:       "9.8.7.6,5.4.3.2-5",
 				NetworkInterface: "ipf0",
 				WatchPort:        12345,
+				VRRPIDOffset:     70,
 				Replicas:         1,
 			},
 			ErrorExpectation: false,
@@ -106,6 +112,11 @@ func TestPluginGetWatchPort(t *testing.T) {
 			Expected:  9999,
 		},
 		{
+			Name:      "service2",
+			WatchPort: 65535,
+			Expected:  65535,
+		},
+		{
 			Name:      "invalid-port",
 			WatchPort: -12345,
 			Expected:  80,
@@ -113,6 +124,11 @@ func TestPluginGetWatchPort(t *testing.T) {
 		{
 			Name:      "invalid-port-2",
 			WatchPort: -1,
+			Expected:  80,
+		},
+		{
+			Name:      "invalid-port-3",
+			WatchPort: 65536,
 			Expected:  80,
 		},
 		{

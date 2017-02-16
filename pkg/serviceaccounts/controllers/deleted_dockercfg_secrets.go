@@ -5,15 +5,14 @@ import (
 	"time"
 
 	"github.com/golang/glog"
+
 	"k8s.io/kubernetes/pkg/api"
 	kapierrors "k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/client"
 	"k8s.io/kubernetes/pkg/client/cache"
-	"k8s.io/kubernetes/pkg/controller/framework"
+	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util"
+	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/watch"
 )
@@ -30,24 +29,26 @@ type DockercfgDeletedControllerOptions struct {
 }
 
 // NewDockercfgDeletedController returns a new *DockercfgDeletedController.
-func NewDockercfgDeletedController(cl client.Interface, options DockercfgDeletedControllerOptions) *DockercfgDeletedController {
+func NewDockercfgDeletedController(cl kclientset.Interface, options DockercfgDeletedControllerOptions) *DockercfgDeletedController {
 	e := &DockercfgDeletedController{
 		client: cl,
 	}
 
-	dockercfgSelector := fields.OneTermEqualSelector(client.SecretType, string(api.SecretTypeDockercfg))
-	_, e.secretController = framework.NewInformer(
+	dockercfgSelector := fields.OneTermEqualSelector(api.SecretTypeField, string(api.SecretTypeDockercfg))
+	_, e.secretController = cache.NewInformer(
 		&cache.ListWatch{
-			ListFunc: func() (runtime.Object, error) {
-				return e.client.Secrets(api.NamespaceAll).List(labels.Everything(), dockercfgSelector)
+			ListFunc: func(options api.ListOptions) (runtime.Object, error) {
+				opts := api.ListOptions{FieldSelector: dockercfgSelector}
+				return e.client.Core().Secrets(api.NamespaceAll).List(opts)
 			},
-			WatchFunc: func(rv string) (watch.Interface, error) {
-				return e.client.Secrets(api.NamespaceAll).Watch(labels.Everything(), dockercfgSelector, rv)
+			WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
+				opts := api.ListOptions{FieldSelector: dockercfgSelector, ResourceVersion: options.ResourceVersion}
+				return e.client.Core().Secrets(api.NamespaceAll).Watch(opts)
 			},
 		},
 		&api.Secret{},
 		options.Resync,
-		framework.ResourceEventHandlerFuncs{
+		cache.ResourceEventHandlerFuncs{
 			DeleteFunc: e.secretDeleted,
 		},
 	)
@@ -60,9 +61,9 @@ func NewDockercfgDeletedController(cl client.Interface, options DockercfgDeleted
 type DockercfgDeletedController struct {
 	stopChan chan struct{}
 
-	client client.Interface
+	client kclientset.Interface
 
-	secretController *framework.Controller
+	secretController *cache.Controller
 }
 
 // Runs controller loops and returns immediately
@@ -107,8 +108,8 @@ func (e *DockercfgDeletedController) secretDeleted(obj interface{}) {
 	}
 
 	// remove the reference token secret
-	if err := e.client.Secrets(dockercfgSecret.Namespace).Delete(dockercfgSecret.Annotations[ServiceAccountTokenSecretNameKey]); (err != nil) && !kapierrors.IsNotFound(err) {
-		util.HandleError(err)
+	if err := e.client.Core().Secrets(dockercfgSecret.Namespace).Delete(dockercfgSecret.Annotations[ServiceAccountTokenSecretNameKey], nil); (err != nil) && !kapierrors.IsNotFound(err) {
+		utilruntime.HandleError(err)
 	}
 }
 
@@ -148,7 +149,7 @@ func (e *DockercfgDeletedController) removeDockercfgSecretReference(dockercfgSec
 	serviceAccount.ImagePullSecrets = imagePullSecrets
 
 	if changed {
-		_, err = e.client.ServiceAccounts(dockercfgSecret.Namespace).Update(serviceAccount)
+		_, err = e.client.Core().ServiceAccounts(dockercfgSecret.Namespace).Update(serviceAccount)
 		if err != nil {
 			return err
 		}
@@ -164,7 +165,7 @@ func (e *DockercfgDeletedController) getServiceAccount(secret *api.Secret) (*api
 		return nil, nil
 	}
 
-	serviceAccount, err := e.client.ServiceAccounts(secret.Namespace).Get(saName)
+	serviceAccount, err := e.client.Core().ServiceAccounts(secret.Namespace).Get(saName)
 	if err != nil {
 		return nil, err
 	}

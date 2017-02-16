@@ -5,10 +5,15 @@
     "name": "etcd",
     "creationTimestamp": null,
     "annotations": {
-      "description": "Example of clustered etcd",
+      "openshift.io/display-name": "etcd",
+      "description": "An example of a clustered etcd key value store. For more information about using this template, including OpenShift considerations, see https://github.com/openshift/origin/blob/master/examples/etcd/README.md.",
       "iconClass": "icon-database",
       "tags": "database,etcd"
     }
+  },
+  "message": "The following service(s) have been created in your project: etcd, etcd-discovery.\n\nFor more information about using this template, including OpenShift considerations, see https://github.com/openshift/origin/blob/master/examples/etcd/README.md.",
+  "labels": {
+    "template": "etcd"
   },
   "objects": [
     {
@@ -58,7 +63,7 @@
         "selector": {
           "name": "etcd-discovery"
         },
-        "portalIP": "None",
+        "clusterIP": "None",
         "type": "ClusterIP",
         "sessionAffinity": "None"
       },
@@ -96,7 +101,7 @@
         "selector": {
           "name": "etcd"
         },
-        "portalIP": "None",
+        "clusterIP": "None",
         "type": "ClusterIP",
         "sessionAffinity": "None"
       },
@@ -133,6 +138,14 @@
             }
           },
           "spec": {
+            "volumes": [
+              {
+                "name": "data",
+                "emptyDir": {
+                  "medium": ""
+                }
+              }
+            ],
             "containers": [
               {
                 "name": "discovery",
@@ -144,6 +157,12 @@
                   {
                     "containerPort": 2379,
                     "protocol": "TCP"
+                  }
+                ],
+                "volumeMounts": [
+                  {
+                    "name": "data",
+                    "mountPath": "/var/lib/etcd"
                   }
                 ],
                 "resources": {},
@@ -191,6 +210,14 @@
             }
           },
           "spec": {
+            "volumes": [
+              {
+                "name": "data",
+                "emptyDir": {
+                  "medium": ""
+                }
+              }
+            ],
             "containers": [
               {
                 "name": "member",
@@ -229,6 +256,12 @@
                   {
                     "name": "ETCDCTL_PEERS",
                     "value": "http://etcd:2379"
+                  }
+                ],
+                "volumeMounts": [
+                  {
+                    "name": "data",
+                    "mountPath": "/var/lib/etcd"
                   }
                 ],
                 "resources": {},
@@ -276,8 +309,5 @@
       "generate": "expression",
       "from": "etcd-cluster-[a-z0-9]{5}"
     }
-  ],
-  "labels": {
-    "template": "etcd"
-  }
+  ]
 }

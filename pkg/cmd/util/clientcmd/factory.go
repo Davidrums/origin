@@ -2,41 +2,39 @@ package clientcmd
 
 import (
 	"fmt"
-	"strconv"
+	"io"
+	"sort"
+	"strings"
+	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/meta"
-	kclient "k8s.io/kubernetes/pkg/client"
-	kclientcmd "k8s.io/kubernetes/pkg/client/clientcmd"
-	"k8s.io/kubernetes/pkg/kubectl"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/apis/batch"
+	"k8s.io/kubernetes/pkg/apis/extensions"
+	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	"k8s.io/kubernetes/pkg/client/typed/discovery"
+	kclientcmd "k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
+	"k8s.io/kubernetes/pkg/controller"
+	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
+	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/runtime"
 
-	"github.com/openshift/origin/pkg/api/latest"
-	"github.com/openshift/origin/pkg/client"
-	"github.com/openshift/origin/pkg/cmd/cli/describe"
+	buildapi "github.com/openshift/origin/pkg/build/api"
+	"github.com/openshift/origin/pkg/cmd/util"
 	deployapi "github.com/openshift/origin/pkg/deploy/api"
-	deploygen "github.com/openshift/origin/pkg/deploy/generator"
-	deployreaper "github.com/openshift/origin/pkg/deploy/reaper"
-	deployscaler "github.com/openshift/origin/pkg/deploy/scaler"
-	routegen "github.com/openshift/origin/pkg/route/generator"
+	deployutil "github.com/openshift/origin/pkg/deploy/util"
+	imageapi "github.com/openshift/origin/pkg/image/api"
 )
 
 // New creates a default Factory for commands that should share identical server
 // connection behavior. Most commands should use this method to get a factory.
 func New(flags *pflag.FlagSet) *Factory {
-	// Override global default to "" so we force the client to ask for user input
-	// TODO refactor this upstream:
-	// DefaultCluster should not be a global
-	// A call to ClientConfig() should always return the best clientCfg possible
-	// even if an error was returned, and let the caller decide what to do
-	kclientcmd.DefaultCluster.Server = ""
-
-	// TODO: there should be two client configs, one for OpenShift, and one for Kubernetes
-	clientConfig := DefaultClientConfig(flags)
-	f := NewFactory(clientConfig)
+	f := NewFactory(nil)
 	f.BindFlags(flags)
 
 	return f
@@ -44,265 +42,382 @@ func New(flags *pflag.FlagSet) *Factory {
 
 // Factory provides common options for OpenShift commands
 type Factory struct {
-	*cmdutil.Factory
-	OpenShiftClientConfig kclientcmd.ClientConfig
-	clients               *clientCache
+	ClientAccessFactory
+	kcmdutil.ObjectMappingFactory
+	kcmdutil.BuilderFactory
 }
+
+var _ kcmdutil.Factory = &Factory{}
 
 // NewFactory creates an object that holds common methods across all OpenShift commands
-func NewFactory(clientConfig kclientcmd.ClientConfig) *Factory {
-	mapper := ShortcutExpander{kubectl.ShortcutExpander{latest.RESTMapper}}
+func NewFactory(optionalClientConfig kclientcmd.ClientConfig) *Factory {
+	clientAccessFactory := NewClientAccessFactory(optionalClientConfig)
+	objectMappingFactory := NewObjectMappingFactory(clientAccessFactory)
+	builderFactory := kcmdutil.NewBuilderFactory(clientAccessFactory, objectMappingFactory)
 
-	clients := &clientCache{
-		clients: make(map[string]*client.Client),
-		loader:  clientConfig,
+	return &Factory{
+		ClientAccessFactory:  clientAccessFactory,
+		ObjectMappingFactory: objectMappingFactory,
+		BuilderFactory:       builderFactory,
 	}
-
-	generators := map[string]kubectl.Generator{
-		"route/v1":          routegen.RouteGenerator{},
-		"run/v1":            deploygen.BasicDeploymentConfigController{},
-		"run-controller/v1": kubectl.BasicReplicationController{},
-	}
-
-	w := &Factory{
-		Factory:               cmdutil.NewFactory(clientConfig),
-		OpenShiftClientConfig: clientConfig,
-		clients:               clients,
-	}
-
-	w.Object = func() (meta.RESTMapper, runtime.ObjectTyper) {
-		if cfg, err := clientConfig.ClientConfig(); err == nil {
-			return kubectl.OutputVersionMapper{mapper, cfg.Version}, api.Scheme
-		}
-		return mapper, api.Scheme
-	}
-
-	kRESTClient := w.Factory.RESTClient
-	w.RESTClient = func(mapping *meta.RESTMapping) (resource.RESTClient, error) {
-		if latest.OriginKind(mapping.Kind, mapping.APIVersion) {
-			client, err := clients.ClientForVersion(mapping.APIVersion)
-			if err != nil {
-				return nil, err
-			}
-			return client.RESTClient, nil
-		}
-		return kRESTClient(mapping)
-	}
-
-	// Save original Describer function
-	kDescriberFunc := w.Factory.Describer
-	w.Describer = func(mapping *meta.RESTMapping) (kubectl.Describer, error) {
-		if latest.OriginKind(mapping.Kind, mapping.APIVersion) {
-			oClient, kClient, err := w.Clients()
-			if err != nil {
-				return nil, fmt.Errorf("unable to create client %s: %v", mapping.Kind, err)
-			}
-
-			cfg, err := clients.ClientConfigForVersion(mapping.APIVersion)
-			if err != nil {
-				return nil, fmt.Errorf("unable to load a client %s: %v", mapping.Kind, err)
-			}
-
-			describer, ok := describe.DescriberFor(mapping.Kind, oClient, kClient, cfg.Host)
-			if !ok {
-				return nil, fmt.Errorf("no description has been implemented for %q", mapping.Kind)
-			}
-			return describer, nil
-		}
-		return kDescriberFunc(mapping)
-	}
-	kScalerFunc := w.Factory.Scaler
-	w.Scaler = func(mapping *meta.RESTMapping) (kubectl.Scaler, error) {
-		oc, kc, err := w.Clients()
-		if err != nil {
-			return nil, err
-		}
-
-		if mapping.Kind == "DeploymentConfig" {
-			return deployscaler.NewDeploymentConfigScaler(oc, kc), nil
-		}
-		return kScalerFunc(mapping)
-	}
-	kReaperFunc := w.Factory.Reaper
-	w.Reaper = func(mapping *meta.RESTMapping) (kubectl.Reaper, error) {
-		oc, kc, err := w.Clients()
-		if err != nil {
-			return nil, err
-		}
-
-		if mapping.Kind == "DeploymentConfig" {
-			return deployreaper.NewDeploymentConfigReaper(oc, kc), nil
-		}
-		return kReaperFunc(mapping)
-	}
-	kGeneratorFunc := w.Factory.Generator
-	w.Generator = func(name string) (kubectl.Generator, bool) {
-		if generator, ok := generators[name]; ok {
-			return generator, true
-		}
-		return kGeneratorFunc(name)
-	}
-	kPodSelectorForObjectFunc := w.Factory.PodSelectorForObject
-	w.PodSelectorForObject = func(object runtime.Object) (string, error) {
-		switch t := object.(type) {
-		case *deployapi.DeploymentConfig:
-			return kubectl.MakeLabels(t.Template.ControllerTemplate.Selector), nil
-		default:
-			return kPodSelectorForObjectFunc(object)
-		}
-	}
-	kPortsForObjectFunc := w.Factory.PortsForObject
-	w.PortsForObject = func(object runtime.Object) ([]string, error) {
-		switch t := object.(type) {
-		case *deployapi.DeploymentConfig:
-			return getPorts(t.Template.ControllerTemplate.Template.Spec), nil
-		default:
-			return kPortsForObjectFunc(object)
-		}
-	}
-	w.Printer = func(mapping *meta.RESTMapping, noHeaders, withNamespace, wide bool, columnLabels []string) (kubectl.ResourcePrinter, error) {
-		return describe.NewHumanReadablePrinter(noHeaders, withNamespace, wide, columnLabels), nil
-	}
-
-	return w
 }
 
-func getPorts(spec api.PodSpec) []string {
-	result := []string{}
-	for _, container := range spec.Containers {
-		for _, port := range container.Ports {
-			result = append(result, strconv.Itoa(port.ContainerPort))
-		}
+// PrintResourceInfos receives a list of resource infos and prints versioned objects if a generic output format was specified
+// otherwise, it iterates through info objects, printing each resource with a unique printer for its mapping
+func (f *Factory) PrintResourceInfos(cmd *cobra.Command, infos []*resource.Info, out io.Writer) error {
+	printer, generic, err := kcmdutil.PrinterForCommand(cmd)
+	if err != nil {
+		return nil
 	}
-	return result
+	if !generic {
+		for _, info := range infos {
+			mapping := info.ResourceMapping()
+			printer, err := f.PrinterForMapping(cmd, mapping, false)
+			if err != nil {
+				return err
+			}
+			if err := printer.PrintObj(info.Object, out); err != nil {
+				return nil
+			}
+		}
+		return nil
+	}
+
+	clientConfig, err := f.ClientConfig()
+	if err != nil {
+		return err
+	}
+	outputVersion, err := kcmdutil.OutputVersion(cmd, clientConfig.GroupVersion)
+	if err != nil {
+		return err
+	}
+	object, err := resource.AsVersionedObject(infos, len(infos) != 1, outputVersion, api.Codecs.LegacyCodec(outputVersion))
+	if err != nil {
+		return err
+	}
+	return printer.PrintObj(object, out)
+
 }
 
-// UpdatePodSpecForObject update the pod specification for the provided object
-// TODO: move to upstream
-func (f *Factory) UpdatePodSpecForObject(obj runtime.Object, fn func(*api.PodSpec) error) (bool, error) {
-	// TODO: replace with a swagger schema based approach (identify pod template via schema introspection)
+// FlagBinder represents an interface that allows to bind extra flags into commands.
+type FlagBinder interface {
+	// Bound returns true if the flag is already bound to a command.
+	Bound() bool
+	// Bind allows to bind an extra flag to a command
+	Bind(*pflag.FlagSet)
+}
+
+func ResourceMapper(f kcmdutil.Factory) *resource.Mapper {
+	mapper, typer := f.Object()
+	return &resource.Mapper{
+		RESTMapper:   mapper,
+		ObjectTyper:  typer,
+		ClientMapper: resource.ClientMapperFunc(f.ClientForMapping),
+	}
+}
+
+// UpdateObjectEnvironment update the environment variables in object specification.
+func (f *Factory) UpdateObjectEnvironment(obj runtime.Object, fn func(*[]api.EnvVar) error) (bool, error) {
 	switch t := obj.(type) {
-	case *api.Pod:
-		return true, fn(&t.Spec)
-	case *api.PodTemplate:
-		return true, fn(&t.Template.Spec)
-	case *api.ReplicationController:
-		if t.Spec.Template == nil {
-			t.Spec.Template = &api.PodTemplateSpec{}
+	case *buildapi.BuildConfig:
+		if t.Spec.Strategy.CustomStrategy != nil {
+			return true, fn(&t.Spec.Strategy.CustomStrategy.Env)
 		}
-		return true, fn(&t.Spec.Template.Spec)
-	case *deployapi.DeploymentConfig:
-		template := t.Template.ControllerTemplate
-		if template.Template == nil {
-			template.Template = &api.PodTemplateSpec{}
+		if t.Spec.Strategy.SourceStrategy != nil {
+			return true, fn(&t.Spec.Strategy.SourceStrategy.Env)
 		}
-		return true, fn(&template.Template.Spec)
+		if t.Spec.Strategy.DockerStrategy != nil {
+			return true, fn(&t.Spec.Strategy.DockerStrategy.Env)
+		}
+	}
+	return false, fmt.Errorf("object does not contain any environment variables")
+}
+
+// ExtractFileContents returns a map of keys to contents, false if the object cannot support such an
+// operation, or an error.
+func (f *Factory) ExtractFileContents(obj runtime.Object) (map[string][]byte, bool, error) {
+	switch t := obj.(type) {
+	case *api.Secret:
+		return t.Data, true, nil
+	case *api.ConfigMap:
+		out := make(map[string][]byte)
+		for k, v := range t.Data {
+			out[k] = []byte(v)
+		}
+		return out, true, nil
 	default:
-		return false, fmt.Errorf("the object is not a pod or does not have a pod template")
+		return nil, false, nil
 	}
 }
 
-// Clients returns an OpenShift and Kubernetes client.
-func (f *Factory) Clients() (*client.Client, *kclient.Client, error) {
-	kClient, err := f.Client()
-	if err != nil {
-		return nil, nil, err
-	}
-	osClient, err := f.clients.ClientForVersion("")
-	if err != nil {
-		return nil, nil, err
-	}
-	return osClient, kClient, nil
-}
+// ApproximatePodTemplateForObject returns a pod template object for the provided source.
+// It may return both an error and a object. It attempt to return the best possible template
+// available at the current time.
+func (f *Factory) ApproximatePodTemplateForObject(object runtime.Object) (*api.PodTemplateSpec, error) {
+	switch t := object.(type) {
+	case *imageapi.ImageStreamTag:
+		// create a minimal pod spec that uses the image referenced by the istag without any introspection
+		// it possible that we could someday do a better job introspecting it
+		return &api.PodTemplateSpec{
+			Spec: api.PodSpec{
+				RestartPolicy: api.RestartPolicyNever,
+				Containers: []api.Container{
+					{Name: "container-00", Image: t.Image.DockerImageReference},
+				},
+			},
+		}, nil
+	case *imageapi.ImageStreamImage:
+		// create a minimal pod spec that uses the image referenced by the istag without any introspection
+		// it possible that we could someday do a better job introspecting it
+		return &api.PodTemplateSpec{
+			Spec: api.PodSpec{
+				RestartPolicy: api.RestartPolicyNever,
+				Containers: []api.Container{
+					{Name: "container-00", Image: t.Image.DockerImageReference},
+				},
+			},
+		}, nil
+	case *deployapi.DeploymentConfig:
+		fallback := t.Spec.Template
 
-// ShortcutExpander is a RESTMapper that can be used for OpenShift resources.
-type ShortcutExpander struct {
-	meta.RESTMapper
-}
-
-// VersionAndKindForResource implements meta.RESTMapper. It expands the resource first, then invokes the wrapped
-// mapper.
-func (e ShortcutExpander) VersionAndKindForResource(resource string) (defaultVersion, kind string, err error) {
-	resource = expandResourceShortcut(resource)
-	return e.RESTMapper.VersionAndKindForResource(resource)
-}
-
-// AliasesForResource returns whether a resource has an alias or not
-func (e ShortcutExpander) AliasesForResource(resource string) ([]string, bool) {
-	aliases := map[string][]string{
-		"all": latest.UserResources,
-	}
-
-	if res, ok := aliases[resource]; ok {
-		return res, true
-	}
-	return nil, false
-}
-
-// expandResourceShortcut will return the expanded version of resource
-// (something that a pkg/api/meta.RESTMapper can understand), if it is
-// indeed a shortcut. Otherwise, will return resource unmodified.
-func expandResourceShortcut(resource string) string {
-	shortForms := map[string]string{
-		"dc":      "deploymentConfigs",
-		"bc":      "buildConfigs",
-		"is":      "imageStreams",
-		"istag":   "imageStreamTags",
-		"isimage": "imageStreamImages",
-		"sa":      "serviceAccounts",
-		"pv":      "persistentVolumes",
-		"pvc":     "persistentVolumeClaims",
-	}
-	if expanded, ok := shortForms[resource]; ok {
-		return expanded
-	}
-	return resource
-}
-
-// clientCache caches previously loaded clients for reuse, and ensures MatchServerVersion
-// is invoked only once
-type clientCache struct {
-	loader        kclientcmd.ClientConfig
-	clients       map[string]*client.Client
-	defaultConfig *kclient.Config
-}
-
-// ClientConfigForVersion returns the correct config for a server
-func (c *clientCache) ClientConfigForVersion(version string) (*kclient.Config, error) {
-	if c.defaultConfig == nil {
-		config, err := c.loader.ClientConfig()
+		_, kc, err := f.Clients()
 		if err != nil {
-			return nil, err
+			return fallback, err
 		}
-		c.defaultConfig = config
-	}
-	// TODO: have a better config copy method
-	config := *c.defaultConfig
-	if len(version) != 0 {
-		config.Version = version
-	}
-	client.SetOpenShiftDefaults(&config)
 
-	return &config, nil
+		latestDeploymentName := deployutil.LatestDeploymentNameForConfig(t)
+		deployment, err := kc.Core().ReplicationControllers(t.Namespace).Get(latestDeploymentName)
+		if err != nil {
+			return fallback, err
+		}
+
+		fallback = deployment.Spec.Template
+
+		pods, err := kc.Core().Pods(deployment.Namespace).List(api.ListOptions{LabelSelector: labels.SelectorFromSet(deployment.Spec.Selector)})
+		if err != nil {
+			return fallback, err
+		}
+
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if fallback == nil || pod.CreationTimestamp.Before(fallback.CreationTimestamp) {
+				fallback = &api.PodTemplateSpec{
+					ObjectMeta: pod.ObjectMeta,
+					Spec:       pod.Spec,
+				}
+			}
+		}
+		return fallback, nil
+
+	default:
+		pod, err := f.AttachablePodForObject(object)
+		if pod != nil {
+			return &api.PodTemplateSpec{
+				ObjectMeta: pod.ObjectMeta,
+				Spec:       pod.Spec,
+			}, err
+		}
+		switch t := object.(type) {
+		case *api.ReplicationController:
+			return t.Spec.Template, err
+		case *extensions.ReplicaSet:
+			return &t.Spec.Template, err
+		case *extensions.DaemonSet:
+			return &t.Spec.Template, err
+		case *batch.Job:
+			return &t.Spec.Template, err
+		}
+		return nil, err
+	}
 }
 
-// ClientForVersion initializes or reuses a client for the specified version, or returns an
-// error if that is not possible
-func (c *clientCache) ClientForVersion(version string) (*client.Client, error) {
-	config, err := c.ClientConfigForVersion(version)
+func (f *Factory) PodForResource(resource string, timeout time.Duration) (string, error) {
+	sortBy := func(pods []*api.Pod) sort.Interface { return sort.Reverse(controller.ActivePods(pods)) }
+	namespace, _, err := f.DefaultNamespace()
+	if err != nil {
+		return "", err
+	}
+	mapper, _ := f.Object()
+	resourceType, name, err := util.ResolveResource(api.Resource("pods"), resource, mapper)
+	if err != nil {
+		return "", err
+	}
+
+	switch resourceType {
+	case api.Resource("pods"):
+		return name, nil
+	case api.Resource("replicationcontrollers"):
+		kc, err := f.ClientSet()
+		if err != nil {
+			return "", err
+		}
+		rc, err := kc.Core().ReplicationControllers(namespace).Get(name)
+		if err != nil {
+			return "", err
+		}
+		selector := labels.SelectorFromSet(rc.Spec.Selector)
+		pod, _, err := kcmdutil.GetFirstPod(kc, namespace, selector, timeout, sortBy)
+		if err != nil {
+			return "", err
+		}
+		return pod.Name, nil
+	case deployapi.Resource("deploymentconfigs"):
+		oc, kc, err := f.Clients()
+		if err != nil {
+			return "", err
+		}
+		dc, err := oc.DeploymentConfigs(namespace).Get(name)
+		if err != nil {
+			return "", err
+		}
+		selector := labels.SelectorFromSet(dc.Spec.Selector)
+		pod, _, err := kcmdutil.GetFirstPod(kc.Core(), namespace, selector, timeout, sortBy)
+		if err != nil {
+			return "", err
+		}
+		return pod.Name, nil
+	case extensions.Resource("daemonsets"):
+		kc, err := f.ClientSet()
+		if err != nil {
+			return "", err
+		}
+		ds, err := kc.Extensions().DaemonSets(namespace).Get(name)
+		if err != nil {
+			return "", err
+		}
+		selector, err := unversioned.LabelSelectorAsSelector(ds.Spec.Selector)
+		if err != nil {
+			return "", err
+		}
+		pod, _, err := kcmdutil.GetFirstPod(kc, namespace, selector, timeout, sortBy)
+		if err != nil {
+			return "", err
+		}
+		return pod.Name, nil
+	case extensions.Resource("deployments"):
+		kc, err := f.ClientSet()
+		if err != nil {
+			return "", err
+		}
+		d, err := kc.Extensions().Deployments(namespace).Get(name)
+		if err != nil {
+			return "", err
+		}
+		selector, err := unversioned.LabelSelectorAsSelector(d.Spec.Selector)
+		if err != nil {
+			return "", err
+		}
+		pod, _, err := kcmdutil.GetFirstPod(kc, namespace, selector, timeout, sortBy)
+		if err != nil {
+			return "", err
+		}
+		return pod.Name, nil
+	case extensions.Resource("replicasets"):
+		kc, err := f.ClientSet()
+		if err != nil {
+			return "", err
+		}
+		rs, err := kc.Extensions().ReplicaSets(namespace).Get(name)
+		if err != nil {
+			return "", err
+		}
+		selector, err := unversioned.LabelSelectorAsSelector(rs.Spec.Selector)
+		if err != nil {
+			return "", err
+		}
+		pod, _, err := kcmdutil.GetFirstPod(kc, namespace, selector, timeout, sortBy)
+		if err != nil {
+			return "", err
+		}
+		return pod.Name, nil
+	case extensions.Resource("jobs"):
+		kc, err := f.ClientSet()
+		if err != nil {
+			return "", err
+		}
+		// TODO/REBASE kc.Extensions() doesn't exist any more. Is this ok?
+		job, err := kc.Batch().Jobs(namespace).Get(name)
+		if err != nil {
+			return "", err
+		}
+		return podNameForJob(job, kc, timeout, sortBy)
+	case batch.Resource("jobs"):
+		kc, err := f.ClientSet()
+		if err != nil {
+			return "", err
+		}
+		job, err := kc.Batch().Jobs(namespace).Get(name)
+		if err != nil {
+			return "", err
+		}
+		return podNameForJob(job, kc, timeout, sortBy)
+	default:
+		return "", fmt.Errorf("remote shell for %s is not supported", resourceType)
+	}
+}
+
+func podNameForJob(job *batch.Job, kc kclientset.Interface, timeout time.Duration, sortBy func(pods []*api.Pod) sort.Interface) (string, error) {
+	selector, err := unversioned.LabelSelectorAsSelector(job.Spec.Selector)
+	if err != nil {
+		return "", err
+	}
+	pod, _, err := kcmdutil.GetFirstPod(kc.Core(), job.Namespace, selector, timeout, sortBy)
+	if err != nil {
+		return "", err
+	}
+	return pod.Name, nil
+}
+
+// FindAllCanonicalResources returns all resource names that map directly to their kind (Kind -> Resource -> Kind)
+// and are not subresources. This is the closest mapping possible from the client side to resources that can be
+// listed and updated. Note that this may return some virtual resources (like imagestreamtags) that can be otherwise
+// represented.
+// TODO: add a field to APIResources for "virtual" (or that points to the canonical resource).
+// TODO: fallback to the scheme when discovery is not possible.
+func FindAllCanonicalResources(d discovery.DiscoveryInterface, m meta.RESTMapper) ([]unversioned.GroupResource, error) {
+	set := make(map[unversioned.GroupResource]struct{})
+	all, err := d.ServerResources()
 	if err != nil {
 		return nil, err
 	}
-
-	if client, ok := c.clients[config.Version]; ok {
-		return client, nil
+	for apiVersion, v := range all {
+		gv, err := unversioned.ParseGroupVersion(apiVersion)
+		if err != nil {
+			continue
+		}
+		for _, r := range v.APIResources {
+			// ignore subresources
+			if strings.Contains(r.Name, "/") {
+				continue
+			}
+			// because discovery info doesn't tell us whether the object is virtual or not, perform a lookup
+			// by the kind for resource (which should be the canonical resource) and then verify that the reverse
+			// lookup (KindsFor) does not error.
+			if mapping, err := m.RESTMapping(unversioned.GroupKind{Group: gv.Group, Kind: r.Kind}, gv.Version); err == nil {
+				if _, err := m.KindsFor(mapping.GroupVersionKind.GroupVersion().WithResource(mapping.Resource)); err == nil {
+					set[unversioned.GroupResource{Group: mapping.GroupVersionKind.Group, Resource: mapping.Resource}] = struct{}{}
+				}
+			}
+		}
 	}
-
-	client, err := client.New(config)
-	if err != nil {
-		return nil, err
+	var groupResources []unversioned.GroupResource
+	for k := range set {
+		groupResources = append(groupResources, k)
 	}
-
-	c.clients[config.Version] = client
-	return client, nil
+	sort.Sort(groupResourcesByName(groupResources))
+	return groupResources, nil
 }
+
+type groupResourcesByName []unversioned.GroupResource
+
+func (g groupResourcesByName) Len() int { return len(g) }
+func (g groupResourcesByName) Less(i, j int) bool {
+	if g[i].Resource < g[j].Resource {
+		return true
+	}
+	if g[i].Resource > g[j].Resource {
+		return false
+	}
+	return g[i].Group < g[j].Group
+}
+func (g groupResourcesByName) Swap(i, j int) { g[i], g[j] = g[j], g[i] }

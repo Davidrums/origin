@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	ktc "k8s.io/kubernetes/pkg/client/testclient"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
 
 	deployapi "github.com/openshift/origin/pkg/deploy/api"
 	deploytest "github.com/openshift/origin/pkg/deploy/api/test"
@@ -13,15 +13,15 @@ import (
 
 func TestRollbackOptions_findTargetDeployment(t *testing.T) {
 	type existingDeployment struct {
-		version int
+		version int64
 		status  deployapi.DeploymentStatus
 	}
 	tests := []struct {
 		name            string
-		configVersion   int
-		desiredVersion  int
+		configVersion   int64
+		desiredVersion  int64
 		existing        []existingDeployment
-		expectedVersion int
+		expectedVersion int64
 		errorExpected   bool
 	}{
 		{
@@ -77,12 +77,12 @@ func TestRollbackOptions_findTargetDeployment(t *testing.T) {
 		existingControllers := &kapi.ReplicationControllerList{}
 		for _, existing := range test.existing {
 			config := deploytest.OkDeploymentConfig(existing.version)
-			deployment, _ := deployutil.MakeDeployment(config, kapi.Codec)
+			deployment, _ := deployutil.MakeDeployment(config, kapi.Codecs.LegacyCodec(deployapi.SchemeGroupVersion))
 			deployment.Annotations[deployapi.DeploymentStatusAnnotation] = string(existing.status)
 			existingControllers.Items = append(existingControllers.Items, *deployment)
 		}
 
-		fakekc := ktc.NewSimpleFake(existingControllers)
+		fakekc := fake.NewSimpleClientset(existingControllers)
 		opts := &RollbackOptions{
 			kc: fakekc,
 		}

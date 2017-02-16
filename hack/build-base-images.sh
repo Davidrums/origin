@@ -1,21 +1,14 @@
 #!/bin/bash
 
 # This script builds the base and release images for use by the release build and image builds.
-#
-# Set OS_IMAGE_PUSH=true to push images to a registry
-#
 
-set -o errexit
-set -o nounset
-set -o pipefail
+STARTTIME=$(date +%s)
+source "$(dirname "${BASH_SOURCE}")/lib/init.sh"
 
-OS_ROOT=$(dirname "${BASH_SOURCE}")/..
-source "${OS_ROOT}/hack/common.sh"
+# determine the correct tag prefix
+tag_prefix="${OS_IMAGE_PREFIX:-"openshift/origin"}"
 
-# Go to the top of the tree.
-cd "${OS_ROOT}"
+# Build the base image without the default image args
+OS_BUILD_IMAGE_ARGS="${OS_BUILD_IMAGE_BASE_ARGS-}" os::build::image "${OS_ROOT}/images/base" "${tag_prefix}-base"
 
-# Build the images
-docker build --tag openshift/origin-base                   "${OS_ROOT}/images/base"
-docker build --tag openshift/origin-haproxy-router-base    "${OS_ROOT}/images/router/haproxy-base"
-docker build --tag openshift/origin-release                "${OS_ROOT}/images/release"
+ret=$?; ENDTIME=$(date +%s); echo "$0 took $(($ENDTIME - $STARTTIME)) seconds"; exit "$ret"

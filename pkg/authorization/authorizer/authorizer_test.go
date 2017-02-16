@@ -8,13 +8,15 @@ import (
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/auth/user"
-	"k8s.io/kubernetes/pkg/controller/serviceaccount"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/serviceaccount"
+	"k8s.io/kubernetes/pkg/util/sets"
 
 	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
 	testpolicyregistry "github.com/openshift/origin/pkg/authorization/registry/test"
 	"github.com/openshift/origin/pkg/authorization/rulevalidation"
 	"github.com/openshift/origin/pkg/cmd/server/bootstrappolicy"
+
+	_ "github.com/openshift/origin/pkg/api/install"
 )
 
 type authorizeTest struct {
@@ -32,6 +34,119 @@ type authorizeTest struct {
 	expectedAllowed bool
 	expectedReason  string
 	expectedError   string
+}
+
+func TestAPIGroupDeny(t *testing.T) {
+	test := &authorizeTest{
+		context: kapi.WithUser(kapi.WithNamespace(kapi.NewContext(), "adze"), &user.DefaultInfo{Name: "Anna"}),
+		attributes: &DefaultAuthorizationAttributes{
+			Verb:     "list",
+			APIGroup: "group",
+			Resource: "pods",
+		},
+		expectedAllowed: false,
+		expectedReason:  `User "Anna" cannot list group.pods in project "adze"`,
+	}
+	test.clusterPolicies = newDefaultClusterPolicies()
+	test.policies = append(test.policies, newAdzePolicies()...)
+	test.clusterBindings = newDefaultClusterPolicyBindings()
+	test.bindings = append(test.bindings, newAdzeBindings()...)
+	test.test(t)
+}
+
+func TestAPIGroupDefaultAllow(t *testing.T) {
+	test := &authorizeTest{
+		context: kapi.WithUser(kapi.WithNamespace(kapi.NewContext(), "adze"), &user.DefaultInfo{Name: "Anna"}),
+		attributes: &DefaultAuthorizationAttributes{
+			Verb:     "list",
+			Resource: "pods",
+		},
+		expectedAllowed: true,
+		expectedReason:  "allowed by rule in adze",
+	}
+	test.clusterPolicies = newDefaultClusterPolicies()
+	test.policies = append(test.policies, newAdzePolicies()...)
+	test.clusterBindings = newDefaultClusterPolicyBindings()
+	test.bindings = append(test.bindings, newAdzeBindings()...)
+	test.test(t)
+}
+
+func TestAPIGroupAllAllow(t *testing.T) {
+	test := &authorizeTest{
+		context: kapi.WithUser(kapi.WithNamespace(kapi.NewContext(), "adze"), &user.DefaultInfo{Name: "Anna"}),
+		attributes: &DefaultAuthorizationAttributes{
+			Verb:     "list",
+			APIGroup: "group",
+			Resource: "pods",
+		},
+		expectedAllowed: true,
+		expectedReason:  "allowed by rule in adze",
+	}
+	test.clusterPolicies = newDefaultClusterPolicies()
+	test.policies = append(test.policies, newAdzePolicies()...)
+	test.clusterBindings = newDefaultClusterPolicyBindings()
+	test.bindings = append(test.bindings, newAdzeBindings()...)
+	test.policies[0].Roles["by-group"] = &authorizationapi.Role{
+		ObjectMeta: kapi.ObjectMeta{
+			Name:      "by-group",
+			Namespace: "adze",
+		},
+		Rules: []authorizationapi.PolicyRule{
+			{
+				Verbs: sets.NewString("list"), APIGroups: []string{"group"}, Resources: sets.NewString("pods"),
+			},
+		},
+	}
+	test.bindings[0].RoleBindings["by-group"] = &authorizationapi.RoleBinding{
+		ObjectMeta: kapi.ObjectMeta{
+			Name: "by-group",
+		},
+		RoleRef: kapi.ObjectReference{
+			Namespace: "adze",
+			Name:      "by-group",
+		},
+		Subjects: []kapi.ObjectReference{{Kind: authorizationapi.UserKind, Name: "Anna"}},
+	}
+	test.test(t)
+}
+
+func TestAPIAllAllow(t *testing.T) {
+	test := &authorizeTest{
+		context: kapi.WithUser(kapi.WithNamespace(kapi.NewContext(), "adze"), &user.DefaultInfo{Name: "Anna"}),
+		attributes: &DefaultAuthorizationAttributes{
+			Verb:     "list",
+			APIGroup: "group",
+			Resource: "pods",
+		},
+		expectedAllowed: true,
+		expectedReason:  "allowed by rule in adze",
+	}
+	test.clusterPolicies = newDefaultClusterPolicies()
+	test.policies = append(test.policies, newAdzePolicies()...)
+	test.clusterBindings = newDefaultClusterPolicyBindings()
+	test.bindings = append(test.bindings, newAdzeBindings()...)
+	test.policies[0].Roles["by-group"] = &authorizationapi.Role{
+		ObjectMeta: kapi.ObjectMeta{
+			Name:      "by-group",
+			Namespace: "adze",
+		},
+		Rules: []authorizationapi.PolicyRule{
+			{
+				Verbs: sets.NewString("list"), APIGroups: []string{authorizationapi.APIGroupAll}, Resources: sets.NewString("pods"),
+			},
+		},
+	}
+	test.bindings[0].RoleBindings["by-group"] = &authorizationapi.RoleBinding{
+		ObjectMeta: kapi.ObjectMeta{
+			Name: "by-group",
+		},
+		RoleRef: kapi.ObjectReference{
+			Namespace: "adze",
+			Name:      "by-group",
+		},
+		Subjects: []kapi.ObjectReference{{Kind: authorizationapi.UserKind, Name: "Anna"}},
+	}
+	test.test(t)
 }
 
 func TestResourceNameDeny(t *testing.T) {
@@ -299,7 +414,7 @@ func TestGlobalPolicyOutranksLocalPolicy(t *testing.T) {
 			Resource: "roles",
 		},
 		expectedAllowed: true,
-		expectedReason:  "allowed by cluster rule",
+		expectedReason:  "allowed by rule in adze",
 	}
 	test.clusterPolicies = newDefaultClusterPolicies()
 	test.policies = append(test.policies, newAdzePolicies()...)
@@ -533,8 +648,9 @@ func newAdzePolicies() []authorizationapi.Policy {
 					},
 					Rules: append(make([]authorizationapi.PolicyRule, 0),
 						authorizationapi.PolicyRule{
-							Verbs:     util.NewStringSet("watch", "list", "get"),
-							Resources: util.NewStringSet("buildConfigs"),
+							APIGroups: []string{""},
+							Verbs:     sets.NewString("watch", "list", "get"),
+							Resources: sets.NewString("buildConfigs"),
 						}),
 				},
 			},

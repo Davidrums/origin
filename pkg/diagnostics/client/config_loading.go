@@ -6,10 +6,11 @@ import (
 	"os"
 
 	flag "github.com/spf13/pflag"
-	"k8s.io/kubernetes/pkg/client/clientcmd"
+	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
 
 	"github.com/openshift/origin/pkg/cmd/cli/config"
 	"github.com/openshift/origin/pkg/diagnostics/types"
+	"github.com/openshift/origin/pkg/diagnostics/util"
 )
 
 // ConfigLoading is a little special in that it is run separately as a precondition
@@ -20,22 +21,27 @@ type ConfigLoading struct {
 	successfulLoad bool // set if at least one file loaded
 }
 
+// Name is part of the Diagnostic interface and just returns name.
 func (d *ConfigLoading) Name() string {
 	return "ConfigLoading"
 }
 
+// Description is part of the Diagnostic interface and provides a user-focused description of what the diagnostic does.
 func (d *ConfigLoading) Description() string {
 	return "Try to load client config file(s) and report what happens"
 }
 
+// CanRun is part of the Diagnostic interface; it determines if the conditions are right to run this diagnostic.
 func (d *ConfigLoading) CanRun() (bool, error) {
 	return true, nil
 }
 
+// SuccessfulLoad returns whether the client config was found
 func (d *ConfigLoading) SuccessfulLoad() bool {
 	return d.successfulLoad
 }
 
+// Check is part of the Diagnostic interface; it runs the actual diagnostic logic
 func (d *ConfigLoading) Check() types.DiagnosticResult {
 	r := types.NewDiagnosticResult("ConfigLoading")
 	confFlagValue := d.ClientFlags.Lookup(d.ConfFlagName).Value.String()
@@ -88,13 +94,8 @@ or you can set the environment variable %[1]s:
 If not, obtain a config file and place it in the standard
 location for use by the client and diagnostics.
 `
-		adminPaths := []string{
-			"/etc/openshift/master/admin.kubeconfig",           // enterprise
-			"/openshift.local.config/master/admin.kubeconfig",  // origin systemd
-			"./openshift.local.config/master/admin.kubeconfig", // origin binary
-		}
 		// look for it in auto-generated locations when not found properly
-		for _, path := range adminPaths {
+		for _, path := range util.AdminKubeConfigPaths {
 			msg := fmt.Sprintf("Looking for a possible client config at %s\n", path)
 			if d.canOpenConfigFile(path, msg, r) {
 				r.Warn("DCli1003", nil, fmt.Sprintf(adminWarningF, config.OpenShiftConfigPathEnvVar, path, config.RecommendedHomeFile))

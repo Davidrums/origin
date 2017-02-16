@@ -6,10 +6,10 @@ import (
 	"testing"
 
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client"
-	"k8s.io/kubernetes/pkg/client/testclient"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
+	"k8s.io/kubernetes/pkg/client/testing/core"
 	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/runtime"
 )
 
@@ -124,40 +124,40 @@ func serviceAccountTokenSecretWithoutTokenData() *api.Secret {
 }
 
 func TestTokenDeletion(t *testing.T) {
-	dockercfgSecretFieldSelector := fields.OneTermEqualSelector(client.SecretType, string(api.SecretTypeDockercfg))
+	dockercfgSecretFieldSelector := fields.OneTermEqualSelector(api.SecretTypeField, string(api.SecretTypeDockercfg))
 
 	testcases := map[string]struct {
 		ClientObjects []runtime.Object
 
 		DeletedSecret *api.Secret
 
-		ExpectedActions []testclient.Action
+		ExpectedActions []core.Action
 	}{
 		"deleted token secret without serviceaccount": {
 			ClientObjects: []runtime.Object{serviceAccount(addTokenSecretReference(tokenSecretReferences()), imagePullSecretReferences()), createdDockercfgSecret()},
 			DeletedSecret: serviceAccountTokenSecret(),
 
-			ExpectedActions: []testclient.Action{
-				testclient.NewListAction("secrets", "default", labels.Everything(), dockercfgSecretFieldSelector),
-				testclient.NewDeleteAction("secrets", "default", "default-dockercfg-fplln"),
+			ExpectedActions: []core.Action{
+				core.NewListAction(unversioned.GroupVersionResource{Resource: "secrets"}, "default", api.ListOptions{FieldSelector: dockercfgSecretFieldSelector}),
+				core.NewDeleteAction(unversioned.GroupVersionResource{Resource: "secrets"}, "default", "default-dockercfg-fplln"),
 			},
 		},
 		"deleted token secret with serviceaccount with reference": {
 			ClientObjects: []runtime.Object{serviceAccount(addTokenSecretReference(tokenSecretReferences()), imagePullSecretReferences()), createdDockercfgSecret()},
 
 			DeletedSecret: serviceAccountTokenSecret(),
-			ExpectedActions: []testclient.Action{
-				testclient.NewListAction("secrets", "default", labels.Everything(), dockercfgSecretFieldSelector),
-				testclient.NewDeleteAction("secrets", "default", "default-dockercfg-fplln"),
+			ExpectedActions: []core.Action{
+				core.NewListAction(unversioned.GroupVersionResource{Resource: "secrets"}, "default", api.ListOptions{FieldSelector: dockercfgSecretFieldSelector}),
+				core.NewDeleteAction(unversioned.GroupVersionResource{Resource: "secrets"}, "default", "default-dockercfg-fplln"),
 			},
 		},
 		"deleted token secret with serviceaccount without reference": {
 			ClientObjects: []runtime.Object{serviceAccount(addTokenSecretReference(tokenSecretReferences()), imagePullSecretReferences()), createdDockercfgSecret()},
 
 			DeletedSecret: serviceAccountTokenSecret(),
-			ExpectedActions: []testclient.Action{
-				testclient.NewListAction("secrets", "default", labels.Everything(), dockercfgSecretFieldSelector),
-				testclient.NewDeleteAction("secrets", "default", "default-dockercfg-fplln"),
+			ExpectedActions: []core.Action{
+				core.NewListAction(unversioned.GroupVersionResource{Resource: "secrets"}, "default", api.ListOptions{FieldSelector: dockercfgSecretFieldSelector}),
+				core.NewDeleteAction(unversioned.GroupVersionResource{Resource: "secrets"}, "default", "default-dockercfg-fplln"),
 			},
 		},
 	}
@@ -166,7 +166,7 @@ func TestTokenDeletion(t *testing.T) {
 		// Re-seed to reset name generation
 		rand.Seed(1)
 
-		client := testclient.NewSimpleFake(tc.ClientObjects...)
+		client := fake.NewSimpleClientset(tc.ClientObjects...)
 
 		controller := NewDockercfgTokenDeletedController(client, DockercfgTokenDeletedControllerOptions{})
 

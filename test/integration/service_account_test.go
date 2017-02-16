@@ -1,5 +1,3 @@
-// +build integration,etcd
-
 package integration
 
 import (
@@ -12,27 +10,30 @@ import (
 
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/errors"
-	kclient "k8s.io/kubernetes/pkg/client"
-	"k8s.io/kubernetes/pkg/client/clientcmd"
-	clientcmdapi "k8s.io/kubernetes/pkg/client/clientcmd/api"
-	"k8s.io/kubernetes/pkg/controller/serviceaccount"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
+	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	"k8s.io/kubernetes/pkg/client/restclient"
+	"k8s.io/kubernetes/pkg/client/retry"
+	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
+	clientcmdapi "k8s.io/kubernetes/pkg/client/unversioned/clientcmd/api"
+	"k8s.io/kubernetes/pkg/serviceaccount"
 	"k8s.io/kubernetes/pkg/util/wait"
 	serviceaccountadmission "k8s.io/kubernetes/plugin/pkg/admission/serviceaccount"
 
 	"github.com/openshift/origin/pkg/cmd/admin/policy"
 	"github.com/openshift/origin/pkg/cmd/server/bootstrappolicy"
 	testutil "github.com/openshift/origin/test/util"
+	testserver "github.com/openshift/origin/test/util/server"
 )
 
 func TestServiceAccountAuthorization(t *testing.T) {
+	testutil.RequireEtcd(t)
+	defer testutil.DumpEtcdOnFailure(t)
 	saNamespace := api.NamespaceDefault
 	saName := serviceaccountadmission.DefaultServiceAccountName
 	saUsername := serviceaccount.MakeUsername(saNamespace, saName)
 
 	// Start one OpenShift master as "cluster1" to play the external kube server
-	cluster1MasterConfig, cluster1AdminConfigFile, err := testutil.StartTestMaster()
+	cluster1MasterConfig, cluster1AdminConfigFile, err := testserver.StartTestMaster()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -40,7 +41,7 @@ func TestServiceAccountAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	cluster1AdminKubeClient, err := testutil.GetClusterAdminKubeClient(cluster1AdminConfigFile)
+	cluster1AdminKubeClientset, err := testutil.GetClusterAdminKubeClient(cluster1AdminConfigFile)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -50,23 +51,22 @@ func TestServiceAccountAuthorization(t *testing.T) {
 	}
 
 	// Get a service account token and build a client
-	saToken, err := waitForServiceAccountToken(cluster1AdminKubeClient, saNamespace, saName, 20, time.Second)
+	saToken, err := waitForServiceAccountToken(cluster1AdminKubeClientset, saNamespace, saName, 20, time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(saToken) == 0 {
 		t.Fatalf("token was not created")
 	}
-	cluster1SAClientConfig := kclient.Config{
+	cluster1SAClientConfig := restclient.Config{
 		Host:        cluster1AdminConfig.Host,
-		Prefix:      cluster1AdminConfig.Prefix,
 		BearerToken: saToken,
-		TLSClientConfig: kclient.TLSClientConfig{
+		TLSClientConfig: restclient.TLSClientConfig{
 			CAFile: cluster1AdminConfig.CAFile,
 			CAData: cluster1AdminConfig.CAData,
 		},
 	}
-	cluster1SAKubeClient, err := kclient.New(&cluster1SAClientConfig)
+	cluster1SAKubeClient, err := kclientset.NewForConfig(&cluster1SAClientConfig)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestServiceAccountAuthorization(t *testing.T) {
 		t.Fatalf("could not add role to service account")
 	}
 
-	// Give the policy cache a second to catch it's breath
+	// Give the policy cache a second to catch its breath
 	time.Sleep(time.Second)
 
 	// Make sure the service account now has access
@@ -108,7 +108,7 @@ func TestServiceAccountAuthorization(t *testing.T) {
 	}
 
 	// Set up cluster 2 to run against cluster 1 as external kubernetes
-	cluster2MasterConfig, err := testutil.DefaultMasterOptions()
+	cluster2MasterConfig, err := testserver.DefaultMasterOptions()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -133,8 +133,8 @@ func TestServiceAccountAuthorization(t *testing.T) {
 	cluster2MasterConfig.DNSConfig = nil
 
 	// Start cluster 2 (without clearing etcd) and get admin client configs and clients
-	cluster2Options := testutil.TestOptions{DeleteAllEtcdKeys: false}
-	cluster2AdminConfigFile, err := testutil.StartConfiguredMasterWithOptions(cluster2MasterConfig, cluster2Options)
+	cluster2Options := testserver.TestOptions{EnableControllers: true}
+	cluster2AdminConfigFile, err := testserver.StartConfiguredMasterWithOptions(cluster2MasterConfig, cluster2Options)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestServiceAccountAuthorization(t *testing.T) {
 	// Build a client to use the same service account token against cluster2
 	cluster2SAClientConfig := cluster1SAClientConfig
 	cluster2SAClientConfig.Host = cluster2AdminConfig.Host
-	cluster2SAKubeClient, err := kclient.New(&cluster2SAClientConfig)
+	cluster2SAKubeClient, err := kclientset.NewForConfig(&cluster2SAClientConfig)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestServiceAccountAuthorization(t *testing.T) {
 		t.Fatalf("could not add role to service account")
 	}
 
-	// Give the policy cache a second to catch it's breath
+	// Give the policy cache a second to catch its breath
 	time.Sleep(time.Second)
 
 	// Make sure the service account now has access to cluster2
@@ -189,7 +189,7 @@ func TestServiceAccountAuthorization(t *testing.T) {
 	}
 }
 
-func writeClientConfigToKubeConfig(config kclient.Config, path string) error {
+func writeClientConfigToKubeConfig(config restclient.Config, path string) error {
 	kubeConfig := &clientcmdapi.Config{
 		Clusters:       map[string]*clientcmdapi.Cluster{"myserver": {Server: config.Host, CertificateAuthority: config.CAFile, CertificateAuthorityData: config.CAData}},
 		AuthInfos:      map[string]*clientcmdapi.AuthInfo{"myuser": {Token: config.BearerToken}},
@@ -205,7 +205,7 @@ func writeClientConfigToKubeConfig(config kclient.Config, path string) error {
 	return nil
 }
 
-func waitForServiceAccountToken(client *kclient.Client, ns, name string, attempts int, interval time.Duration) (string, error) {
+func waitForServiceAccountToken(client *kclientset.Clientset, ns, name string, attempts int, interval time.Duration) (string, error) {
 	for i := 0; i <= attempts; i++ {
 		time.Sleep(interval)
 		token, err := getServiceAccountToken(client, ns, name)
@@ -219,14 +219,14 @@ func waitForServiceAccountToken(client *kclient.Client, ns, name string, attempt
 	return "", nil
 }
 
-func getServiceAccountToken(client *kclient.Client, ns, name string) (string, error) {
-	secrets, err := client.Secrets(ns).List(labels.Everything(), fields.Everything())
+func getServiceAccountToken(client *kclientset.Clientset, ns, name string) (string, error) {
+	secrets, err := client.Core().Secrets(ns).List(api.ListOptions{})
 	if err != nil {
 		return "", err
 	}
 	for _, secret := range secrets.Items {
 		if secret.Type == api.SecretTypeServiceAccountToken && secret.Annotations[api.ServiceAccountNameKey] == name {
-			sa, err := client.ServiceAccounts(ns).Get(name)
+			sa, err := client.Core().ServiceAccounts(ns).Get(name)
 			if err != nil {
 				return "", err
 			}
@@ -247,7 +247,9 @@ func TestAutomaticCreationOfPullSecrets(t *testing.T) {
 	saNamespace := api.NamespaceDefault
 	saName := serviceaccountadmission.DefaultServiceAccountName
 
-	_, clusterAdminConfig, err := testutil.StartTestMaster()
+	testutil.RequireEtcd(t)
+	defer testutil.DumpEtcdOnFailure(t)
+	_, clusterAdminConfig, err := testserver.StartTestMaster()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -275,7 +277,7 @@ func TestAutomaticCreationOfPullSecrets(t *testing.T) {
 	}
 }
 
-func waitForServiceAccountPullSecret(client *kclient.Client, ns, name string, attempts int, interval time.Duration) (string, error) {
+func waitForServiceAccountPullSecret(client *kclientset.Clientset, ns, name string, attempts int, interval time.Duration) (string, error) {
 	for i := 0; i <= attempts; i++ {
 		time.Sleep(interval)
 		token, err := getServiceAccountPullSecret(client, ns, name)
@@ -289,8 +291,8 @@ func waitForServiceAccountPullSecret(client *kclient.Client, ns, name string, at
 	return "", nil
 }
 
-func getServiceAccountPullSecret(client *kclient.Client, ns, name string) (string, error) {
-	secrets, err := client.Secrets(ns).List(labels.Everything(), fields.Everything())
+func getServiceAccountPullSecret(client *kclientset.Clientset, ns, name string) (string, error) {
+	secrets, err := client.Core().Secrets(ns).List(api.ListOptions{})
 	if err != nil {
 		return "", err
 	}
@@ -303,13 +305,15 @@ func getServiceAccountPullSecret(client *kclient.Client, ns, name string) (strin
 }
 
 func TestEnforcingServiceAccount(t *testing.T) {
-	masterConfig, err := testutil.DefaultMasterOptions()
+	testutil.RequireEtcd(t)
+	defer testutil.DumpEtcdOnFailure(t)
+	masterConfig, err := testserver.DefaultMasterOptions()
 	masterConfig.ServiceAccountConfig.LimitSecretReferences = false
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	clusterAdminConfig, err := testutil.StartConfiguredMaster(masterConfig)
+	clusterAdminConfig, err := testserver.StartConfiguredMaster(masterConfig)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -363,18 +367,18 @@ func TestEnforcingServiceAccount(t *testing.T) {
 
 	clusterAdminKubeClient.Pods(api.NamespaceDefault).Delete(pod.Name, nil)
 
-	sa, err := clusterAdminKubeClient.ServiceAccounts(api.NamespaceDefault).Get(bootstrappolicy.DeployerServiceAccountName)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if sa.Annotations == nil {
-		sa.Annotations = map[string]string{}
-	}
-	sa.Annotations[serviceaccountadmission.EnforceMountableSecretsAnnotation] = "true"
-
-	time.Sleep(5)
-
-	_, err = clusterAdminKubeClient.ServiceAccounts(api.NamespaceDefault).Update(sa)
+	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		sa, err := clusterAdminKubeClient.ServiceAccounts(api.NamespaceDefault).Get(bootstrappolicy.DeployerServiceAccountName)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if sa.Annotations == nil {
+			sa.Annotations = map[string]string{}
+		}
+		sa.Annotations[serviceaccountadmission.EnforceMountableSecretsAnnotation] = "true"
+		_, err = clusterAdminKubeClient.ServiceAccounts(api.NamespaceDefault).Update(sa)
+		return err
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

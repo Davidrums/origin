@@ -6,9 +6,9 @@ import (
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/fields"
 	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/registry/generic"
 	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/fielderrors"
+	kstorage "k8s.io/kubernetes/pkg/storage"
+	"k8s.io/kubernetes/pkg/util/validation/field"
 
 	"github.com/openshift/origin/pkg/build/api"
 	"github.com/openshift/origin/pkg/build/api/validation"
@@ -37,28 +37,40 @@ func (strategy) AllowUnconditionalUpdate() bool {
 }
 
 // PrepareForCreate clears fields that are not allowed to be set by end users on creation.
-func (strategy) PrepareForCreate(obj runtime.Object) {
-	_ = obj.(*api.BuildConfig)
+func (strategy) PrepareForCreate(ctx kapi.Context, obj runtime.Object) {
+	bc := obj.(*api.BuildConfig)
+	dropUnknownTriggers(bc)
+}
+
+// Canonicalize normalizes the object after validation.
+func (strategy) Canonicalize(obj runtime.Object) {
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (strategy) PrepareForUpdate(obj, old runtime.Object) {
-	_ = obj.(*api.BuildConfig)
+func (strategy) PrepareForUpdate(ctx kapi.Context, obj, old runtime.Object) {
+	newBC := obj.(*api.BuildConfig)
+	oldBC := old.(*api.BuildConfig)
+	dropUnknownTriggers(newBC)
+	// Do not allow the build version to go backwards or we'll
+	// get conflicts with existing builds.
+	if newBC.Status.LastVersion < oldBC.Status.LastVersion {
+		newBC.Status.LastVersion = oldBC.Status.LastVersion
+	}
 }
 
 // Validate validates a new policy.
-func (strategy) Validate(ctx kapi.Context, obj runtime.Object) fielderrors.ValidationErrorList {
+func (strategy) Validate(ctx kapi.Context, obj runtime.Object) field.ErrorList {
 	return validation.ValidateBuildConfig(obj.(*api.BuildConfig))
 }
 
 // ValidateUpdate is the default update validation for an end user.
-func (strategy) ValidateUpdate(ctx kapi.Context, obj, old runtime.Object) fielderrors.ValidationErrorList {
+func (strategy) ValidateUpdate(ctx kapi.Context, obj, old runtime.Object) field.ErrorList {
 	return validation.ValidateBuildConfigUpdate(obj.(*api.BuildConfig), old.(*api.BuildConfig))
 }
 
 // Matcher returns a generic matcher for a given label and field selector.
-func Matcher(label labels.Selector, field fields.Selector) generic.Matcher {
-	return &generic.SelectionPredicate{
+func Matcher(label labels.Selector, field fields.Selector) kstorage.SelectionPredicate {
+	return kstorage.SelectionPredicate{
 		Label: label,
 		Field: field,
 		GetAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
@@ -66,17 +78,23 @@ func Matcher(label labels.Selector, field fields.Selector) generic.Matcher {
 			if !ok {
 				return nil, nil, fmt.Errorf("not a BuildConfig")
 			}
-			return labels.Set(buildConfig.ObjectMeta.Labels), SelectableFields(buildConfig), nil
+			return labels.Set(buildConfig.ObjectMeta.Labels), api.BuildConfigToSelectableFields(buildConfig), nil
 		},
 	}
-}
-
-// SelectableFields returns a label set that represents the object
-func SelectableFields(buildConfig *api.BuildConfig) fields.Set {
-	return fields.Set{}
 }
 
 // CheckGracefulDelete allows a build config to be gracefully deleted.
 func (strategy) CheckGracefulDelete(obj runtime.Object, options *kapi.DeleteOptions) bool {
 	return false
+}
+
+// dropUnknownTriggers drops any triggers that are of an unknown type
+func dropUnknownTriggers(bc *api.BuildConfig) {
+	triggers := []api.BuildTriggerPolicy{}
+	for _, t := range bc.Spec.Triggers {
+		if api.KnownTriggerTypes.Has(string(t.Type)) {
+			triggers = append(triggers, t)
+		}
+	}
+	bc.Spec.Triggers = triggers
 }

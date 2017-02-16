@@ -4,13 +4,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"runtime"
 
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 
+	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+
+	"github.com/openshift/origin/pkg/cmd/cli/cmd"
 	cmdutil "github.com/openshift/origin/pkg/cmd/util"
-	"github.com/openshift/origin/pkg/version"
 )
 
 const kubernetesLong = `
@@ -20,15 +22,12 @@ The primary Kubernetes server components can be started individually using their
 arguments. No configuration settings will be used when launching these components.
 `
 
-func NewCommand(name, fullName string, out io.Writer) *cobra.Command {
+func NewCommand(name, fullName string, out, errOut io.Writer) *cobra.Command {
 	cmds := &cobra.Command{
 		Use:   name,
 		Short: "Kubernetes server components",
 		Long:  fmt.Sprintf(kubernetesLong),
-		Run: func(c *cobra.Command, args []string) {
-			c.SetOutput(os.Stdout)
-			c.Help()
-		},
+		Run:   kcmdutil.DefaultSubCommandRun(errOut),
 	}
 
 	cmds.AddCommand(NewAPIServerCommand("apiserver", fullName+" apiserver", out))
@@ -37,7 +36,7 @@ func NewCommand(name, fullName string, out io.Writer) *cobra.Command {
 	cmds.AddCommand(NewProxyCommand("proxy", fullName+" proxy", out))
 	cmds.AddCommand(NewSchedulerCommand("scheduler", fullName+" scheduler", out))
 	if "hyperkube" == fullName {
-		cmds.AddCommand(version.NewVersionCommand(fullName))
+		cmds.AddCommand(cmd.NewCmdVersion(fullName, nil, out, cmd.VersionOptions{}))
 	}
 
 	return cmds
@@ -46,8 +45,11 @@ func NewCommand(name, fullName string, out io.Writer) *cobra.Command {
 func startProfiler() {
 	if cmdutil.Env("OPENSHIFT_PROFILE", "") == "web" {
 		go func() {
-			glog.Infof("Starting profiling endpoint at http://127.0.0.1:6060/debug/pprof/")
-			glog.Fatal(http.ListenAndServe("127.0.0.1:6060", nil))
+			runtime.SetBlockProfileRate(1)
+			profilePort := cmdutil.Env("OPENSHIFT_PROFILE_PORT", "6060")
+			profileHost := cmdutil.Env("OPENSHIFT_PROFILE_HOST", "127.0.0.1")
+			glog.Infof(fmt.Sprintf("Starting profiling endpoint at http://%s:%s/debug/pprof/", profileHost, profilePort))
+			glog.Fatal(http.ListenAndServe(fmt.Sprintf("%s:%s", profileHost, profilePort), nil))
 		}()
 	}
 }

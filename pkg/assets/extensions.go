@@ -11,17 +11,17 @@ import (
 	"path/filepath"
 	"strings"
 
-	"k8s.io/kubernetes/pkg/util"
+	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 )
 
 // ExtensionScriptsHandler concatenates and serves extension JavaScript files as one HTTP response.
 func ExtensionScriptsHandler(files []string, developmentMode bool) (http.Handler, error) {
-	return concatHandler(files, developmentMode, "text/javascript", ";\n")
+	return concatHandler(files, developmentMode, "application/javascript; charset=utf-8", ";\n")
 }
 
 // ExtensionStylesheetsHandler concatenates and serves extension stylesheets as one HTTP response.
 func ExtensionStylesheetsHandler(files []string, developmentMode bool) (http.Handler, error) {
-	return concatHandler(files, developmentMode, "text/css", "\n")
+	return concatHandler(files, developmentMode, "text/css; charset=utf-8", "\n")
 }
 
 func concatHandler(files []string, developmentMode bool, mediaType, separator string) (http.Handler, error) {
@@ -30,7 +30,7 @@ func concatHandler(files []string, developmentMode bool, mediaType, separator st
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			bytes, err := concatAll(files, separator)
 			if err != nil {
-				util.HandleError(fmt.Errorf("Error serving extension content: %v", err))
+				utilruntime.HandleError(fmt.Errorf("Error serving extension content: %v", err))
 				http.Error(w, "Internal server error", http.StatusInternalServerError)
 			}
 			serve(w, r, bytes, mediaType, "")
@@ -96,11 +96,6 @@ func generateETag(w http.ResponseWriter, r *http.Request, hash string) string {
 }
 
 func serve(w http.ResponseWriter, r *http.Request, bytes []byte, mediaType, hash string) {
-	if len(bytes) == 0 {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
 	if len(hash) > 0 {
 		etag := generateETag(w, r, hash)
 		if r.Header.Get("If-None-Match") == etag {
@@ -117,7 +112,7 @@ func serve(w http.ResponseWriter, r *http.Request, bytes []byte, mediaType, hash
 	w.Header().Set("Content-Type", mediaType)
 	_, err := w.Write(bytes)
 	if err != nil {
-		util.HandleError(fmt.Errorf("Error serving extension content: %v", err))
+		utilruntime.HandleError(fmt.Errorf("Error serving extension content: %v", err))
 	}
 }
 
@@ -144,7 +139,7 @@ func serveIndex(w http.ResponseWriter, r *http.Request, path, base string) {
 	content = bytes.Replace(content, []byte(`<base href="/">`), []byte(fmt.Sprintf(`<base href="%s">`, base)), 1)
 
 	w.Header().Add("Cache-Control", "no-cache, no-store")
-	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
 
 	w.Write(content)
 }
@@ -175,7 +170,7 @@ func serveExtensionFile(w http.ResponseWriter, r *http.Request, sourceDir, conte
 				return
 			}
 
-			util.HandleError(fmt.Errorf("Error serving extension file: %v", err))
+			utilruntime.HandleError(fmt.Errorf("Error serving extension file: %v", err))
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}

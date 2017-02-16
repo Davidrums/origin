@@ -4,22 +4,28 @@ import (
 	"net/http"
 
 	kapi "k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/apiserver/request"
 	"k8s.io/kubernetes/pkg/auth/user"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/sets"
 )
 
 type Authorizer interface {
-	Authorize(ctx kapi.Context, a AuthorizationAttributes) (allowed bool, reason string, err error)
-	GetAllowedSubjects(ctx kapi.Context, attributes AuthorizationAttributes) (util.StringSet, util.StringSet, error)
+	Authorize(ctx kapi.Context, a Action) (allowed bool, reason string, err error)
+	GetAllowedSubjects(ctx kapi.Context, attributes Action) (sets.String, sets.String, error)
 }
 
 type AuthorizationAttributeBuilder interface {
-	GetAttributes(request *http.Request) (AuthorizationAttributes, error)
+	GetAttributes(request *http.Request) (Action, error)
 }
 
-type AuthorizationAttributes interface {
+type RequestInfoFactory interface {
+	NewRequestInfo(req *http.Request) (*request.RequestInfo, error)
+}
+
+type Action interface {
 	GetVerb() string
 	GetAPIVersion() string
+	GetAPIGroup() string
 	// GetResource returns the resource type.  If IsNonResourceURL() is true, then GetResource() is "".
 	GetResource() string
 	GetResourceName() string
@@ -40,5 +46,5 @@ type ForbiddenMessageMaker interface {
 type MessageContext struct {
 	User       user.Info
 	Namespace  string
-	Attributes AuthorizationAttributes
+	Attributes Action
 }

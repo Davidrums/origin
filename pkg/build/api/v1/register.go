@@ -1,11 +1,23 @@
 package v1
 
 import (
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/runtime"
 )
 
-func init() {
-	api.Scheme.AddKnownTypes("v1",
+const GroupName = ""
+
+// SchemeGroupVersion is group version used to register these objects
+var SchemeGroupVersion = unversioned.GroupVersion{Group: GroupName, Version: "v1"}
+
+var (
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes, addConversionFuncs, addDefaultingFuncs)
+	AddToScheme   = SchemeBuilder.AddToScheme
+)
+
+// Adds the list of known types to api.Scheme.
+func addKnownTypes(scheme *runtime.Scheme) error {
+	scheme.AddKnownTypes(SchemeGroupVersion,
 		&Build{},
 		&BuildList{},
 		&BuildConfig{},
@@ -13,13 +25,16 @@ func init() {
 		&BuildLog{},
 		&BuildRequest{},
 		&BuildLogOptions{},
+		&BinaryBuildRequestOptions{},
 	)
+	return nil
 }
 
-func (*Build) IsAnAPIObject()           {}
-func (*BuildList) IsAnAPIObject()       {}
-func (*BuildConfig) IsAnAPIObject()     {}
-func (*BuildConfigList) IsAnAPIObject() {}
-func (*BuildLog) IsAnAPIObject()        {}
-func (*BuildRequest) IsAnAPIObject()    {}
-func (*BuildLogOptions) IsAnAPIObject() {}
+func (obj *Build) GetObjectKind() unversioned.ObjectKind                     { return &obj.TypeMeta }
+func (obj *BuildList) GetObjectKind() unversioned.ObjectKind                 { return &obj.TypeMeta }
+func (obj *BuildConfig) GetObjectKind() unversioned.ObjectKind               { return &obj.TypeMeta }
+func (obj *BuildConfigList) GetObjectKind() unversioned.ObjectKind           { return &obj.TypeMeta }
+func (obj *BuildLog) GetObjectKind() unversioned.ObjectKind                  { return &obj.TypeMeta }
+func (obj *BuildRequest) GetObjectKind() unversioned.ObjectKind              { return &obj.TypeMeta }
+func (obj *BuildLogOptions) GetObjectKind() unversioned.ObjectKind           { return &obj.TypeMeta }
+func (obj *BinaryBuildRequestOptions) GetObjectKind() unversioned.ObjectKind { return &obj.TypeMeta }

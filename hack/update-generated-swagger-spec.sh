@@ -1,26 +1,16 @@
 #!/bin/bash
 
 # Script to create latest swagger spec.
+source "$(dirname "${BASH_SOURCE}")/lib/init.sh"
 
-set -o errexit
-set -o nounset
-set -o pipefail
-
-OS_ROOT=$(dirname "${BASH_SOURCE}")/..
-source "${OS_ROOT}/hack/util.sh"
-
-os::log::install_errexit
-
-function cleanup()
-{
+function cleanup() {
     out=$?
-    pkill -P $$
-    rm -rf "${TEMP_DIR}"
+    cleanup_openshift
 
     if [ $out -ne 0 ]; then
         echo "[FAIL] !!!!! Generate Failed !!!!"
         echo
-        cat "${TEMP_DIR}/openshift.log"
+        tail -100 "${LOG_DIR}/openshift.log"
         echo
         echo -------------------------------------
         echo
@@ -31,53 +21,62 @@ function cleanup()
 trap "exit" INT TERM
 trap "cleanup" EXIT
 
-set -e
+export ALL_IP_ADDRESSES=127.0.0.1
+export SERVER_HOSTNAME_LIST=127.0.0.1
+export API_BIND_HOST=127.0.0.1
+export API_PORT=38443
+export ETCD_PORT=34001
+export ETCD_PEER_PORT=37001
+os::util::environment::setup_all_server_vars "generate-swagger-spec/"
+os::start::configure_server
 
-ADDR=127.0.0.1:8443
-HOST=https://${ADDR}
-SWAGGER_SPEC_REL_DIR=${1:-""}
+SWAGGER_SPEC_REL_DIR="${1:-}"
 SWAGGER_SPEC_OUT_DIR="${OS_ROOT}/${SWAGGER_SPEC_REL_DIR}/api/swagger-spec"
-mkdir -p "${SWAGGER_SPEC_OUT_DIR}" || echo $? > /dev/null
-SWAGGER_API_PATH="${HOST}/swaggerapi/"
-
-# Prevent user environment from colliding with the test setup
-unset KUBECONFIG
-
-openshift=$(cd "${OS_ROOT}"; echo "$(pwd)/_output/local/go/bin/openshift")
-
-if [[ ! -e "${openshift}" ]]; then
-  {
-    echo "It looks as if you don't have a compiled openshift binary"
-    echo
-    echo "If you are running from a clone of the git repo, please run"
-    echo "'./hack/build-go.sh'."
-  } >&2
-  exit 1
-fi
-
-# create temp dir
-TEMP_DIR=${USE_TEMP:-$(mktemp -d /tmp/openshift-cmd.XXXX)}
-export CURL_CA_BUNDLE="${TEMP_DIR}/openshift.local.config/master/ca.crt"
+mkdir -p "${SWAGGER_SPEC_OUT_DIR}"
 
 # Start openshift
-echo "Starting OpenShift..."
-pushd "${TEMP_DIR}" > /dev/null
-OPENSHIFT_ON_PANIC=crash "${openshift}" start master --master="https://127.0.0.1:8443" >/dev/null 2>&1  &
-OS_PID=$!
-popd > /dev/null
+os::start::master
 
-wait_for_url "${HOST}/healthz" "apiserver: " 0.25 80
+os::log::info "Updating ${SWAGGER_SPEC_OUT_DIR}:"
 
-echo "Updating ${SWAGGER_SPEC_OUT_DIR}:"
+endpoint_types=("oapi" "api")
+for type in "${endpoint_types[@]}"; do
+    endpoints=("v1")
+    for endpoint in "${endpoints[@]}"; do
+        generated_file="${SWAGGER_SPEC_OUT_DIR}/${type}-${endpoint}.json"
+        os::log::info "Updating ${generated_file} from /swaggerapi/${type}/${endpoint}..."
+        oc get --raw "/swaggerapi/${type}/${endpoint}" --config="${MASTER_CONFIG_DIR}/admin.kubeconfig" > "${generated_file}"
 
-ENDPOINT_TYPES="oapi api"
-for type in $ENDPOINT_TYPES
-do
-    ENDPOINTS=(v1)
-    for endpoint in $ENDPOINTS
-    do
-        echo "Updating ${SWAGGER_SPEC_OUT_DIR}/${type}-${endpoint}.json from ${SWAGGER_API_PATH}${type}/${endpoint}..."
-        curl -w "\n" "${SWAGGER_API_PATH}${type}/${endpoint}" > "${SWAGGER_SPEC_OUT_DIR}/${type}-${endpoint}.json"
+        os::util::sed 's|https://127.0.0.1:38443|https://127.0.0.1:8443|g' "${generated_file}"
+        printf '\n' >> "${generated_file}"
     done
 done
-echo "SUCCESS"
+
+# Swagger 2.0 / OpenAPI docs
+generated_file="${SWAGGER_SPEC_OUT_DIR}/openshift-openapi-spec.json"
+oc get --raw "/swagger.json" --config="${MASTER_CONFIG_DIR}/admin.kubeconfig" > "${generated_file}"
+
+os::util::sed 's|https://127.0.0.1:38443|https://127.0.0.1:8443|g' "${generated_file}"
+os::util::sed -r 's|"version": "[^\"]+"|"version": "latest"|g' "${generated_file}"
+printf '\n' >> "${generated_file}"
+
+# Copy all protobuf generated specs into the api/protobuf-spec directory
+proto_spec_out_dir="${OS_ROOT}/${SWAGGER_SPEC_REL_DIR}/api/protobuf-spec"
+mkdir -p "${proto_spec_out_dir}"
+for proto_file in $( find "${OS_ROOT}/pkg" "${OS_ROOT}/vendor/k8s.io/kubernetes/pkg" -name generated.proto ); do
+    # package declaration lines will always begin with
+    # `package ` and end with `;` so to extract the
+    # package name without lookarounds we can simply
+    # strip characters
+    package_declaration="$( grep -E '^package .+;$' "${proto_file}" )"
+    package="$( echo "${package_declaration}" | cut -c 9- | cut -f 1-1 -d ';' )"
+
+    # we want our OpenAPI documents to use underscores
+    # as separators for package specifiers, not periods
+    # as in the proto files
+    openapi_file="${package//./_}.proto"
+
+    cp "${proto_file}" "${proto_spec_out_dir}/${openapi_file}"
+done
+
+os::log::info "SUCCESS"

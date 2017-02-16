@@ -4,19 +4,21 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/registry/service/allocator"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/registry/core/service/allocator"
+	"k8s.io/kubernetes/pkg/util/sets"
 
 	"github.com/openshift/origin/pkg/security/mcs"
 )
 
 func TestAllocate(t *testing.T) {
 	ranger, _ := mcs.NewRange("s0:", 5, 2)
-	r := New(ranger, allocator.NewContiguousAllocationInterface)
+	r := New(ranger, func(max int, rangeSpec string) allocator.Interface {
+		return allocator.NewContiguousAllocationMap(max, rangeSpec)
+	})
 	if f := r.Free(); f != 10 {
 		t.Errorf("unexpected free %d", f)
 	}
-	found := util.NewStringSet()
+	found := sets.NewString()
 	count := 0
 	for r.Free() > 0 {
 		label, err := r.AllocateNext()

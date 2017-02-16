@@ -3,41 +3,50 @@ package cmd
 import (
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/spf13/cobra"
 	kapi "k8s.io/kubernetes/pkg/api"
 	kcmd "k8s.io/kubernetes/pkg/kubectl/cmd"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
 
+	"github.com/openshift/origin/pkg/cmd/templates"
+	cmdutil "github.com/openshift/origin/pkg/cmd/util"
 	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
 )
 
-const (
-	exposeLong = `
-Expose containers internally as services or externally via routes
+var (
+	exposeLong = templates.LongDesc(`
+		Expose containers internally as services or externally via routes
 
-There is also the ability to expose a deployment configuration, replication controller, service, or pod
-as a new service on a specified port. If no labels are specified, the new object will re-use the
-labels from the object it exposes.`
+		There is also the ability to expose a deployment configuration, replication controller, service, or pod
+		as a new service on a specified port. If no labels are specified, the new object will re-use the
+		labels from the object it exposes.`)
 
-	exposeExample = `  // Create a route based on service nginx. The new route will re-use nginx's labels
-  $ %[1]s expose service nginx
+	exposeExample = templates.Examples(`
+		# Create a route based on service nginx. The new route will re-use nginx's labels
+	  %[1]s expose service nginx
 
-  // Create a route and specify your own label and route name
-  $ %[1]s expose service nginx -l name=myroute --name=fromdowntown
+	  # Create a route and specify your own label and route name
+	  %[1]s expose service nginx -l name=myroute --name=fromdowntown
 
-  // Create a route and specify a hostname
-  $ %[1]s expose service nginx --hostname=www.example.com
+	  # Create a route and specify a hostname
+	  %[1]s expose service nginx --hostname=www.example.com
 
-  // Expose a deployment configuration as a service and use the specified port
-  $ %[1]s expose dc ruby-hello-world --port=8080`
+	  # Create a route with wildcard
+	  %[1]s expose service nginx --hostname=x.example.com --wildcard-policy=Subdomain
+	  This would be equivalent to *.example.com. NOTE: only hosts are matched by the wildcard, subdomains would not be included.
+
+	  # Expose a deployment configuration as a service and use the specified port
+	  %[1]s expose dc ruby-hello-world --port=8080
+
+	  # Expose a service as a route in the specified path
+	  %[1]s expose service nginx --path=/nginx`)
 )
 
 // NewCmdExpose is a wrapper for the Kubernetes cli expose command
 func NewCmdExpose(fullName string, f *clientcmd.Factory, out io.Writer) *cobra.Command {
-	cmd := kcmd.NewCmdExposeService(f.Factory, out)
+	cmd := kcmd.NewCmdExposeService(f, out)
 	cmd.Short = "Expose a replicated application as a service or route"
 	cmd.Long = exposeLong
 	cmd.Example = fmt.Sprintf(exposeExample, fullName)
@@ -50,20 +59,24 @@ func NewCmdExpose(fullName string, f *clientcmd.Factory, out io.Writer) *cobra.C
 	// when validating the use of it (invalid for routes)
 	cmd.Flags().Set("protocol", "")
 	cmd.Flag("protocol").DefValue = ""
+	cmd.Flag("protocol").Changed = false
+	cmd.Flag("port").Usage = "The port that the resource should serve on."
+	defRun := cmd.Run
 	cmd.Run = func(cmd *cobra.Command, args []string) {
 		err := validate(cmd, f, args)
-		cmdutil.CheckErr(err)
-		err = kcmd.RunExpose(f.Factory, out, cmd, args)
-		cmdutil.CheckErr(err)
+		kcmdutil.CheckErr(err)
+		defRun(cmd, args)
 	}
 	cmd.Flags().String("hostname", "", "Set a hostname for the new route")
+	cmd.Flags().String("path", "", "Set a path for the new route")
+	cmd.Flags().String("wildcard-policy", "", "Sets the WildcardPolicy for the hostname, the default is \"None\". Valid values are \"None\" and \"Subdomain\"")
 	return cmd
 }
 
 // validate adds one layer of validation prior to calling the upstream
 // expose command.
 func validate(cmd *cobra.Command, f *clientcmd.Factory, args []string) error {
-	namespace, _, err := f.DefaultNamespace()
+	namespace, enforceNamespace, err := f.DefaultNamespace()
 	if err != nil {
 		return err
 	}
@@ -74,133 +87,69 @@ func validate(cmd *cobra.Command, f *clientcmd.Factory, args []string) error {
 	}
 
 	mapper, typer := f.Object()
-	r := resource.NewBuilder(mapper, typer, f.ClientMapperForCommand()).
+	r := resource.NewBuilder(mapper, typer, resource.ClientMapperFunc(f.ClientForMapping), kapi.Codecs.UniversalDecoder()).
 		ContinueOnError().
 		NamespaceParam(namespace).DefaultNamespace().
+		FilenameParam(enforceNamespace, &resource.FilenameOptions{Recursive: false, Filenames: kcmdutil.GetFlagStringSlice(cmd, "filename")}).
 		ResourceTypeOrNameArgs(false, args...).
 		Flatten().
 		Do()
-	err = r.Err()
-	if err != nil {
-		return err
-	}
-	mapping, err := r.ResourceMapping()
-	if err != nil {
-		return err
-	}
 	infos, err := r.Infos()
 	if err != nil {
-		return err
+		return kcmdutil.UsageError(cmd, err.Error())
 	}
+
+	wildcardpolicy := kcmdutil.GetFlagString(cmd, "wildcard-policy")
+	if len(wildcardpolicy) > 0 && (wildcardpolicy != "Subdomain" && wildcardpolicy != "None") {
+		return fmt.Errorf("only \"Subdomain\" or \"None\" are supported for wildcard-policy")
+	}
+
 	if len(infos) > 1 {
 		return fmt.Errorf("multiple resources provided: %v", args)
 	}
 	info := infos[0]
+	mapping := info.ResourceMapping()
 
-	generator := cmdutil.GetFlagString(cmd, "generator")
-	switch mapping.Kind {
-	case "Service":
+	generator := kcmdutil.GetFlagString(cmd, "generator")
+	switch mapping.GroupVersionKind.GroupKind() {
+	case kapi.Kind("Service"):
 		switch generator {
-		case "service/v1":
+		case "service/v1", "service/v2":
 			// Set default protocol back for generating services
-			if len(cmdutil.GetFlagString(cmd, "protocol")) == 0 {
+			if len(kcmdutil.GetFlagString(cmd, "protocol")) == 0 {
 				cmd.Flags().Set("protocol", "TCP")
 			}
-			return validateFlags(cmd, "service/v1")
 		case "":
 			// Default exposing services as a route
-			cmd.Flags().Set("generator", "route/v1")
+			generator = "route/v1"
+			cmd.Flags().Set("generator", generator)
 			fallthrough
 		case "route/v1":
-			// We need to validate services exposed as routes
-			if err := validateFlags(cmd, "route/v1"); err != nil {
-				return err
-			}
-			svc, err := kc.Services(info.Namespace).Get(info.Name)
+			route, err := cmdutil.UnsecuredRoute(kc, namespace, info.Name, info.Name, kcmdutil.GetFlagString(cmd, "port"))
 			if err != nil {
 				return err
 			}
-
-			supportsTCP := false
-			for _, port := range svc.Spec.Ports {
-				if port.Protocol == kapi.ProtocolTCP {
-					supportsTCP = true
-					break
-				}
-			}
-			if !supportsTCP {
-				return fmt.Errorf("service %s doesn't support TCP", info.Name)
+			if route.Spec.Port != nil {
+				cmd.Flags().Set("port", route.Spec.Port.TargetPort.String())
 			}
 		}
 
 	default:
 		switch generator {
 		case "route/v1":
-			return fmt.Errorf("cannot expose a %s as a route", mapping.Kind)
+			return fmt.Errorf("cannot expose a %s as a route", mapping.GroupVersionKind.Kind)
 		case "":
 			// Default exposing everything except services as a service
-			cmd.Flags().Set("generator", "service/v1")
+			generator = "service/v2"
+			cmd.Flags().Set("generator", generator)
 			fallthrough
-		case "service/v1":
+		case "service/v1", "service/v2":
 			// Set default protocol back for generating services
-			if len(cmdutil.GetFlagString(cmd, "protocol")) == 0 {
+			if len(kcmdutil.GetFlagString(cmd, "protocol")) == 0 {
 				cmd.Flags().Set("protocol", "TCP")
 			}
-			return validateFlags(cmd, "service/v1")
 		}
 	}
 
 	return nil
-}
-
-// validateFlags filters out flags that are not supposed to be used
-// when exposing a resource; depends on the provided generator
-func validateFlags(cmd *cobra.Command, generator string) error {
-	invalidFlags := []string{}
-
-	if generator == "service/v1" {
-		if len(cmdutil.GetFlagString(cmd, "hostname")) != 0 {
-			invalidFlags = append(invalidFlags, "--hostname")
-		}
-	} else if generator == "route/v1" {
-		if len(cmdutil.GetFlagString(cmd, "protocol")) != 0 {
-			invalidFlags = append(invalidFlags, "--protocol")
-		}
-		if len(cmdutil.GetFlagString(cmd, "type")) != 0 {
-			invalidFlags = append(invalidFlags, "--type")
-		}
-		if len(cmdutil.GetFlagString(cmd, "selector")) != 0 {
-			invalidFlags = append(invalidFlags, "--selector")
-		}
-		if len(cmdutil.GetFlagString(cmd, "container-port")) != 0 {
-			invalidFlags = append(invalidFlags, "--container-port")
-		}
-		if len(cmdutil.GetFlagString(cmd, "target-port")) != 0 {
-			invalidFlags = append(invalidFlags, "--target-port")
-		}
-		if len(cmdutil.GetFlagString(cmd, "public-ip")) != 0 {
-			invalidFlags = append(invalidFlags, "--public-ip")
-		}
-		if cmdutil.GetFlagInt(cmd, "port") != -1 {
-			invalidFlags = append(invalidFlags, "--port")
-		}
-		if cmdutil.GetFlagBool(cmd, "create-external-load-balancer") {
-			invalidFlags = append(invalidFlags, "--create-external-load-balancer")
-		}
-	}
-
-	msg := ""
-	switch len(invalidFlags) {
-	case 0:
-		return nil
-
-	case 1:
-		msg = invalidFlags[0]
-
-	default:
-		commaSeparated, last := invalidFlags[:len(invalidFlags)-1], invalidFlags[len(invalidFlags)-1]
-		msg = fmt.Sprintf("%s or %s", strings.Join(commaSeparated, ", "), last)
-	}
-
-	return fmt.Errorf("cannot use %s when generating a %s", msg, strings.Split(generator, "/")[0])
 }

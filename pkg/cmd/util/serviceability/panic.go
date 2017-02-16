@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/util"
+	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 )
 
 // BehaviorOnPanic is a helper for setting the crash mode of OpenShift when a panic is caught.
@@ -15,7 +15,7 @@ func BehaviorOnPanic(mode string) (fn func()) {
 	switch {
 	case mode == "crash":
 		glog.Infof("Process will terminate as soon as a panic occurs.")
-		util.ReallyCrash = true
+		utilruntime.ReallyCrash = true
 	case strings.HasPrefix(mode, "sentry:"):
 		url := strings.TrimPrefix(mode, "sentry:")
 		m, err := NewSentryMonitor(url)
@@ -24,8 +24,9 @@ func BehaviorOnPanic(mode string) (fn func()) {
 			return
 		}
 		glog.Infof("Process will log all panics and errors to Sentry.")
-		util.PanicHandlers = append(util.PanicHandlers, m.CapturePanic)
-		util.ErrorHandlers = append(util.ErrorHandlers, m.CaptureError)
+		utilruntime.ReallyCrash = false
+		utilruntime.PanicHandlers = append(utilruntime.PanicHandlers, m.CapturePanic)
+		utilruntime.ErrorHandlers = append(utilruntime.ErrorHandlers, m.CaptureError)
 		fn = func() {
 			if r := recover(); r != nil {
 				m.CapturePanicAndWait(r, 2*time.Second)
@@ -34,6 +35,7 @@ func BehaviorOnPanic(mode string) (fn func()) {
 		}
 	case len(mode) == 0:
 		// default panic behavior
+		utilruntime.ReallyCrash = false
 	default:
 		glog.Errorf("Unrecognized panic behavior")
 	}

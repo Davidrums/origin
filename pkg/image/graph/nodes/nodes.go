@@ -48,15 +48,7 @@ func EnsureDockerRepositoryNode(g osgraph.MutableUniqueGraph, name, tag string) 
 		if len(tag) != 0 {
 			ref.Tag = tag
 		}
-		if len(ref.Tag) == 0 {
-			ref.Tag = imageapi.DefaultImageTag
-		}
-		if len(ref.Registry) == 0 {
-			ref.Registry = "docker.io"
-		}
-		if len(ref.Namespace) == 0 {
-			ref.Namespace = imageapi.DockerDefaultNamespace
-		}
+		ref = ref.DockerClientDefaults()
 	} else {
 		ref = imageapi.DockerImageReference{Name: name}
 	}
@@ -169,12 +161,36 @@ func FindOrCreateSyntheticImageStreamNode(g osgraph.MutableUniqueGraph, is *imag
 	).(*ImageStreamNode)
 }
 
-// EnsureImageLayerNode adds a graph node for the layer if it does not already exist.
-func EnsureImageLayerNode(g osgraph.MutableUniqueGraph, layer string) graph.Node {
-	return osgraph.EnsureUnique(g,
-		ImageLayerNodeName(layer),
+func ensureImageComponentNode(g osgraph.MutableUniqueGraph, name string, t ImageComponentType) graph.Node {
+	node := osgraph.EnsureUnique(g,
+		ImageComponentNodeName(name),
 		func(node osgraph.Node) graph.Node {
-			return &ImageLayerNode{node, layer}
+			return &ImageComponentNode{
+				Node:      node,
+				Component: name,
+				Type:      t,
+			}
 		},
 	)
+
+	// If at least one image referers to the blob as its config, treat it as a config even if it is a layer of
+	// some other image.
+	if t == ImageComponentTypeConfig {
+		cn := node.(*ImageComponentNode)
+		if cn.Type != ImageComponentTypeConfig {
+			cn.Type = ImageComponentTypeConfig
+		}
+	}
+
+	return node
+}
+
+// EnsureImageComponentConfigNode adds a graph node for the image config if it does not already exist.
+func EnsureImageComponentConfigNode(g osgraph.MutableUniqueGraph, name string) graph.Node {
+	return ensureImageComponentNode(g, name, ImageComponentTypeConfig)
+}
+
+// EnsureImageComponentLayerNode adds a graph node for the image layer if it does not already exist.
+func EnsureImageComponentLayerNode(g osgraph.MutableUniqueGraph, name string) graph.Node {
+	return ensureImageComponentNode(g, name, ImageComponentTypeLayer)
 }

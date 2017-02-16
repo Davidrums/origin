@@ -2,193 +2,90 @@
 
 # This script tests the high level end-to-end functionality demonstrated
 # as part of the examples/sample-app
+STARTTIME=$(date +%s)
+source "$(dirname "${BASH_SOURCE}")/lib/init.sh"
 
-set -o errexit
-set -o nounset
-set -o pipefail
-
-OS_ROOT=$(dirname "${BASH_SOURCE}")/..
-source "${OS_ROOT}/hack/util.sh"
-
-echo "[INFO] Starting containerized end-to-end test"
-
-# Use either the latest release built images, or latest.
-if [[ -z "${USE_IMAGES-}" ]]; then
-  tag="latest"
-  if [[ -e "${OS_ROOT}/_output/local/releases/.commit" ]]; then
-    COMMIT="$(cat "${OS_ROOT}/_output/local/releases/.commit")"
-    tag="${COMMIT}"
-  fi
-  USE_IMAGES="openshift/origin-\${component}:${tag}"
-fi
+os::log::info "Starting containerized end-to-end test"
 
 unset KUBECONFIG
 
-if [[ -z "${BASETMPDIR-}" ]]; then
-  TMPDIR="${TMPDIR:-"/tmp"}"
-  BASETMPDIR="${TMPDIR}/openshift-e2e-containerized"
-  sudo rm -rf "${BASETMPDIR}"
-  mkdir -p "${BASETMPDIR}"
-fi
-
-VOLUME_DIR="${BASETMPDIR}/volumes"
-# when selinux is enforcing, the volume dir selinux label needs to be
-# svirt_sandbox_file_t
-#
-# TODO: fix the selinux policy to either allow openshift_var_lib_dir_t
-# or to default the volume dir to svirt_sandbox_file_t.
-sudo mkdir -p ${VOLUME_DIR}
-if selinuxenabled; then
-  sudo chcon -t svirt_sandbox_file_t ${VOLUME_DIR}
-fi
-
-FAKE_HOME_DIR="${BASETMPDIR}/openshift.local.home"
-LOG_DIR="${LOG_DIR:-${BASETMPDIR}/logs}"
-ARTIFACT_DIR="${ARTIFACT_DIR:-${BASETMPDIR}/artifacts}"
-mkdir -p $LOG_DIR
-mkdir -p $ARTIFACT_DIR
-
-GO_OUT="${OS_ROOT}/_output/local/go/bin"
-
-# set path so OpenShift is available
-export PATH="${GO_OUT}:${PATH}"
-
+os::util::environment::use_sudo
+os::util::environment::setup_all_server_vars "test-end-to-end-docker/"
 
 function cleanup()
 {
-  out=$?
-  echo
-  if [ $out -ne 0 ]; then
-    echo "[FAIL] !!!!! Test Failed !!!!"
-  else
-    echo "[INFO] Test Succeeded"
-  fi
-  echo
+	out=$?
+	echo
+	if [ $out -ne 0 ]; then
+		echo "[FAIL] !!!!! Test Failed !!!!"
+	else
+		os::log::info "Test Succeeded"
+	fi
+	echo
 
-  set +e
-  dump_container_logs
+	set +e
+	dump_container_logs
 
-  if [[ -z "${SKIP_TEARDOWN-}" ]]; then
-    echo "[INFO] Deleting test constructs"
-    sudo docker exec origin oc delete -n test all --all
-    sudo docker exec origin oc delete -n default all --all
+	# pull information out of the server log so that we can get failure management in jenkins to highlight it and
+	# really have it smack people in their logs.  This is a severe correctness problem
+    grep -a5 "CACHE.*ALTERED" ${LOG_DIR}/container-origin.log
 
-    echo "[INFO] Waiting for volume mounts to be cleaned up"
-    wait_for_command '[[ "$(mount | grep pods | grep ${VOLUME_DIR} | wc -l)" = "0" ]]' $((120*TIME_SEC))
+	os::cleanup::dump_etcd
 
-    echo "[INFO] Tearing down test"
-    docker stop origin
-    docker rm origin
+	if [[ -z "${SKIP_TEARDOWN-}" ]]; then
+		os::log::info "remove the openshift container"
+		docker stop origin
+		docker rm origin
 
-    echo "[INFO] Stopping k8s docker containers"; docker ps | awk 'index($NF,"k8s_")==1 { print $1 }' | xargs -l -r docker stop
-    if [[ -z "${SKIP_IMAGE_CLEANUP-}" ]]; then
-      echo "[INFO] Removing k8s docker containers"; docker ps -a | awk 'index($NF,"k8s_")==1 { print $1 }' | xargs -l -r docker rm
-    fi
-    set -u
-  fi
-  set -e
+		os::log::info "Stopping k8s docker containers"; docker ps | awk 'index($NF,"k8s_")==1 { print $1 }' | xargs -l -r docker stop
+		if [[ -z "${SKIP_IMAGE_CLEANUP-}" ]]; then
+			os::log::info "Removing k8s docker containers"; docker ps -a | awk 'index($NF,"k8s_")==1 { print $1 }' | xargs -l -r docker rm
+		fi
+		set -u
+	fi
 
-  delete_large_and_empty_logs
+	journalctl --unit docker.service --since -15minutes > "${LOG_DIR}/docker.log"
 
-  echo "[INFO] Exiting"
-  exit $out
+	delete_empty_logs
+	truncate_large_logs
+	set -e
+
+	os::log::info "Exiting"
+	ENDTIME=$(date +%s); echo "$0 took $(($ENDTIME - $STARTTIME)) seconds"
+	exit $out
 }
 
-trap "exit" INT TERM
-trap "cleanup" EXIT
+trap "cleanup" EXIT INT TERM
 
-function wait_for_app() {
-  echo "[INFO] Waiting for app in namespace $1"
-  echo "[INFO] Waiting for database pod to start"
-  wait_for_command "oc get -n $1 pods -l name=database | grep -i Running" $((60*TIME_SEC))
-
-  echo "[INFO] Waiting for database service to start"
-  wait_for_command "oc get -n $1 services | grep database" $((20*TIME_SEC))
-  DB_IP=$(oc get -n $1 --output-version=v1beta3 --template="{{ .spec.portalIP }}" service database)
-
-  echo "[INFO] Waiting for frontend pod to start"
-  wait_for_command "oc get -n $1 pods | grep frontend | grep -i Running" $((120*TIME_SEC))
-
-  echo "[INFO] Waiting for frontend service to start"
-  wait_for_command "oc get -n $1 services | grep frontend" $((20*TIME_SEC))
-  FRONTEND_IP=$(oc get -n $1 --output-version=v1beta3 --template="{{ .spec.portalIP }}" service frontend)
-
-  echo "[INFO] Waiting for database to start..."
-  wait_for_url_timed "http://${DB_IP}:5434" "[INFO] Database says: " $((3*TIME_MIN))
-
-  echo "[INFO] Waiting for app to start..."
-  wait_for_url_timed "http://${FRONTEND_IP}:5432" "[INFO] Frontend says: " $((2*TIME_MIN))
-
-  echo "[INFO] Testing app"
-  wait_for_command '[[ "$(curl -s -X POST http://${FRONTEND_IP}:5432/keys/foo -d value=1337)" = "Key created" ]]'
-  wait_for_command '[[ "$(curl -s http://${FRONTEND_IP}:5432/keys/foo)" = "1337" ]]'
-}
-
-# Wait for builds to complete
-# $1 namespace
-function wait_for_build() {
-  echo "[INFO] Waiting for $1 namespace build to complete"
-  wait_for_command "oc get -n $1 builds | grep -i complete" $((10*TIME_MIN)) "oc get -n $1 builds | grep -i -e failed -e error"
-  BUILD_ID=`oc get -n $1 builds --output-version=v1beta3 -t "{{with index .items 0}}{{.metadata.name}}{{end}}"`
-  echo "[INFO] Build ${BUILD_ID} finished"
-  # TODO: fix
-  set +e
-  oc build-logs -n $1 $BUILD_ID > $LOG_DIR/$1build.log
-  set -e
-}
+os::log::system::start
 
 out=$(
-  set +e
-  docker stop origin 2>&1
-  docker rm origin 2>&1
-  set -e
+	set +e
+	docker stop origin 2>&1
+	docker rm origin 2>&1
+	set -e
 )
 
 # Setup
-echo "[INFO] `openshift version`"
-echo "[INFO] Using images:              ${USE_IMAGES}"
+os::log::info "openshift version: `openshift version`"
+os::log::info "oc version:        `oc version`"
+os::log::info "Using images:							${USE_IMAGES}"
 
-echo "[INFO] Starting OpenShift containerized server"
-sudo docker run -d --name="origin" \
-  --privileged --net=host \
-  -v /:/rootfs:ro -v /var/run:/var/run:rw -v /sys:/sys:ro -v /var/lib/docker:/var/lib/docker:rw \
-  -v "${VOLUME_DIR}:${VOLUME_DIR}" \
-  "openshift/origin:${tag}" start --volume-dir=${VOLUME_DIR} --images="${USE_IMAGES}"
+os::log::info "Starting OpenShift containerized server"
+oc cluster up --server-loglevel=4 --version="${TAG}" \
+        --host-data-dir="${VOLUME_DIR}/etcd" \
+        --host-volumes-dir="${VOLUME_DIR}"
 
-export HOME="${FAKE_HOME_DIR}"
-# This directory must exist so Docker can store credentials in $HOME/.dockercfg
-mkdir -p ${FAKE_HOME_DIR}
+oc cluster status
 
-CURL_EXTRA="-k"
+IMAGE_WORKING_DIR=/var/lib/origin
+docker cp origin:${IMAGE_WORKING_DIR}/openshift.local.config ${BASETMPDIR}
 
-wait_for_url "https://localhost:8443/healthz/ready" "apiserver(ready): " 0.25 160
-
-# install the router
-echo "[INFO] Installing the router"
-sudo docker exec origin bash -c "echo '{\"kind\":\"ServiceAccount\",\"apiVersion\":\"v1\",\"metadata\":{\"name\":\"router\"}}' | openshift cli create -f -"
-sudo docker exec origin bash -c "openshift cli get scc privileged -o json | sed '/\"users\"/a \"system:serviceaccount:default:router\",' | openshift cli replace scc privileged -f -"
-sudo docker exec origin openshift admin router --create --credentials="./openshift.local.config/master/openshift-router.kubeconfig" --images="${USE_IMAGES}" --service-account=router
-
-# install the registry. The --mount-host option is provided to reuse local storage.
-echo "[INFO] Installing the registry"
-sudo docker exec origin openshift admin registry --create --credentials="./openshift.local.config/master/openshift-registry.kubeconfig" --images="${USE_IMAGES}"
-
-registry="$(dig @localhost "docker-registry.default.svc.cluster.local." +short A | head -n 1)"
-[ -n "${registry}" ]
-echo "[INFO] Verifying the docker-registry is up at ${registry}"
-wait_for_url_timed "http://${registry}:5000/healthz" "[INFO] Docker registry says: " $((2*TIME_MIN))
+export ADMIN_KUBECONFIG="${MASTER_CONFIG_DIR}/admin.kubeconfig"
+export CLUSTER_ADMIN_CONTEXT=$(oc config view --config=${ADMIN_KUBECONFIG} --flatten -o template --template='{{index . "current-context"}}')
+sudo chmod -R a+rwX "${ADMIN_KUBECONFIG}"
+export KUBECONFIG="${ADMIN_KUBECONFIG}"
+os::log::info "To debug: export KUBECONFIG=$ADMIN_KUBECONFIG"
 
 
-echo "[INFO] Login"
-oc login localhost:8443 -u test -p test --insecure-skip-tls-verify
-oc new-project test
-
-echo "[INFO] Applying STI application config"
-oc new-app -f examples/sample-app/application-template-stibuild.json
-
-# Wait for build which should have triggered automatically
-echo "[INFO] Starting build..."
-#oc start-build -n test ruby-sample-build --follow
-wait_for_build "test"
-wait_for_app "test"
-
+${OS_ROOT}/test/end-to-end/core.sh

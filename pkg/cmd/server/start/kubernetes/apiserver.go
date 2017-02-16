@@ -6,10 +6,11 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 
-	"k8s.io/kubernetes/cmd/kube-apiserver/app"
-	"k8s.io/kubernetes/pkg/util"
+	apiserverapp "k8s.io/kubernetes/cmd/kube-apiserver/app"
+	apiserveroptions "k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	kflag "k8s.io/kubernetes/pkg/util/flag"
+	"k8s.io/kubernetes/pkg/util/logs"
 )
 
 const apiserverLong = `
@@ -19,7 +20,7 @@ This command launches an instance of the Kubernetes apiserver (kube-apiserver).`
 
 // NewAPIServerCommand provides a CLI handler for the 'apiserver' command
 func NewAPIServerCommand(name, fullName string, out io.Writer) *cobra.Command {
-	s := app.NewAPIServer()
+	apiServerOptions := apiserveroptions.NewServerRunOptions()
 
 	cmd := &cobra.Command{
 		Use:   name,
@@ -28,10 +29,10 @@ func NewAPIServerCommand(name, fullName string, out io.Writer) *cobra.Command {
 		Run: func(c *cobra.Command, args []string) {
 			startProfiler()
 
-			util.InitLogs()
-			defer util.FlushLogs()
+			logs.InitLogs()
+			defer logs.FlushLogs()
 
-			if err := s.Run(pflag.CommandLine.Args()); err != nil {
+			if err := apiserverapp.Run(apiServerOptions); err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
 			}
@@ -40,9 +41,8 @@ func NewAPIServerCommand(name, fullName string, out io.Writer) *cobra.Command {
 	cmd.SetOutput(out)
 
 	flags := cmd.Flags()
-	//TODO: uncomment after picking up a newer cobra
-	//pflag.AddFlagSetToPFlagSet(flag, flags)
-	s.AddFlags(flags)
+	flags.SetNormalizeFunc(kflag.WordSepNormalizeFunc)
+	apiServerOptions.AddFlags(flags)
 
 	return cmd
 }

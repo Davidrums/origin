@@ -4,10 +4,9 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"strconv"
 	"strings"
 
-	"github.com/go-ldap/ldap"
+	"gopkg.in/ldap.v2"
 )
 
 // Scheme is a valid ldap scheme
@@ -38,8 +37,8 @@ const (
 )
 
 const (
-	defaultLDAPPort  = 389
-	defaultLDAPSPort = 636
+	defaultLDAPPort  = "389"
+	defaultLDAPSPort = "636"
 
 	defaultHost           = "localhost"
 	defaultQueryAttribute = "uid"
@@ -158,9 +157,9 @@ func DetermineLDAPHost(hostport string, scheme Scheme) (string, error) {
 	if _, _, err := net.SplitHostPort(hostport); err != nil {
 		switch scheme {
 		case SchemeLDAPS:
-			return net.JoinHostPort(hostport, strconv.Itoa(defaultLDAPSPort)), nil
+			return net.JoinHostPort(hostport, defaultLDAPSPort), nil
 		case SchemeLDAP:
-			return net.JoinHostPort(hostport, strconv.Itoa(defaultLDAPPort)), nil
+			return net.JoinHostPort(hostport, defaultLDAPPort), nil
 		default:
 			return "", fmt.Errorf("no default port for scheme %q", scheme)
 		}
@@ -206,7 +205,7 @@ func SplitLDAPQuery(query string) (attributes, scope, filter, extensions string,
 	}
 }
 
-// DeterminmeLDAPScope determines the LDAP search scope. Scope is one of "sub", "one", or "base"
+// DetermineLDAPScope determines the LDAP search scope. Scope is one of "sub", "one", or "base"
 // Default to "sub" to match mod_auth_ldap
 func DetermineLDAPScope(scope string) (Scope, error) {
 	switch scope {
@@ -242,7 +241,7 @@ func DetermineDerefAliasesBehavior(derefAliasesString string) (DerefAliases, err
 	}
 	derefAliases, exists := mapping[derefAliasesString]
 	if !exists {
-		return -1, fmt.Errorf("not a valid LDAP search scope: %s", derefAliasesString)
+		return -1, fmt.Errorf("not a valid LDAP alias dereferncing behavior: %s", derefAliasesString)
 	}
 	return derefAliases, nil
 }

@@ -6,7 +6,8 @@ import (
 	"time"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/util/sets"
 
 	deployapi "github.com/openshift/origin/pkg/deploy/api"
 )
@@ -16,12 +17,12 @@ func mockDeploymentConfig(namespace, name string) *deployapi.DeploymentConfig {
 }
 
 func withSize(item *kapi.ReplicationController, replicas int) *kapi.ReplicationController {
-	item.Spec.Replicas = replicas
-	item.Status.Replicas = replicas
+	item.Spec.Replicas = int32(replicas)
+	item.Status.Replicas = int32(replicas)
 	return item
 }
 
-func withCreated(item *kapi.ReplicationController, creationTimestamp util.Time) *kapi.ReplicationController {
+func withCreated(item *kapi.ReplicationController, creationTimestamp unversioned.Time) *kapi.ReplicationController {
 	item.CreationTimestamp = creationTimestamp
 	return item
 }
@@ -64,8 +65,8 @@ func TestDeploymentByDeploymentConfigIndexFunc(t *testing.T) {
 
 func TestFilterBeforePredicate(t *testing.T) {
 	youngerThan := time.Hour
-	now := util.Now()
-	old := util.NewTime(now.Time.Add(-1 * youngerThan))
+	now := unversioned.Now()
+	old := unversioned.NewTime(now.Time.Add(-1 * youngerThan))
 	items := []*kapi.ReplicationController{}
 	items = append(items, withCreated(mockDeployment("a", "old", nil), old))
 	items = append(items, withCreated(mockDeployment("a", "new", nil), now))
@@ -149,7 +150,7 @@ func TestPopulatedDataSet(t *testing.T) {
 			}
 		}
 	}
-	expectedNames := util.NewStringSet("deployment-1", "deployment-2")
+	expectedNames := sets.NewString("deployment-1", "deployment-2")
 	deploymentResults, err := dataSet.ListDeploymentsByDeploymentConfig(deploymentConfigs[0])
 	if err != nil {
 		t.Errorf("Unexpected result %v", err)

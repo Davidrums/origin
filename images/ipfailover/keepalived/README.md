@@ -31,8 +31,7 @@ Pre-requisites/Prep Time
         [ -n "$KUBECONFIG" ] ||  \
            export KUBECONFIG=/openshift.local.config/master/admin.kubeconfig
         #  openshift kube get dc,rc,pods,se,mi,routes
-        oadm router arparp --create --replicas=2  \
-                                   --credentials="${KUBECONFIG}"
+        oadm router arparp --replicas=2
 
 
 3. Wait for the Router pods to get into running state (I'm just sitting
@@ -54,13 +53,13 @@ Pre-requisites/Prep Time
         $ #  This will be a bit slow, but it should return a 503 HTTP code
         $ #  indicating that haproxy is serving on port 80.
         $ vagrant ssh minion-1
-        sudo docker ps  | grep "openshift/origin-haproxy-router"
-        curl -s -o /dev/null -w "%{http_code}\n"  http://localhost/
+        [minion-1@localhost ~]$ sudo docker ps  | grep "openshift/origin-haproxy-router"
+        [minion-1@localhost ~]$ curl -s -o /dev/null -w "%{http_code}\n"  http://localhost/
 
         $ #  Repeat on minion-2:
         $ vagrant ssh minion-2
-        sudo docker ps  | grep "openshift/origin-haproxy-router"
-        curl -s -o /dev/null -w "%{http_code}\n"  http://localhost/
+        [minion-2@localhost ~]$ sudo docker ps  | grep "openshift/origin-haproxy-router"
+        [minion-2@localhost ~]$ curl -s -o /dev/null -w "%{http_code}\n"  http://localhost/
 
 
 5. Create an user, project and app.

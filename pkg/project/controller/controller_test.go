@@ -3,21 +3,23 @@ package controller
 import (
 	"testing"
 
+	kapi "k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/client/testing/core"
+
 	"github.com/openshift/origin/pkg/client/testclient"
 	"github.com/openshift/origin/pkg/project/api"
-	kapi "k8s.io/kubernetes/pkg/api"
-	ktestclient "k8s.io/kubernetes/pkg/client/testclient"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
 )
 
 func TestSyncNamespaceThatIsTerminating(t *testing.T) {
-	mockKubeClient := &ktestclient.Fake{}
+	mockKubeClient := &fake.Clientset{}
 	mockOriginClient := &testclient.Fake{}
 	nm := NamespaceController{
 		KubeClient: mockKubeClient,
 		Client:     mockOriginClient,
 	}
-	now := util.Now()
+	now := unversioned.Now()
 	testNamespace := &kapi.Namespace{
 		ObjectMeta: kapi.ObjectMeta{
 			Name:              "test",
@@ -37,34 +39,36 @@ func TestSyncNamespaceThatIsTerminating(t *testing.T) {
 	}
 
 	// TODO: we will expect a finalize namespace call after rebase
-	expectedActionSet := []ktestclient.Action{
-		ktestclient.NewListAction("buildconfigs", "", nil, nil),
-		ktestclient.NewListAction("policies", "", nil, nil),
-		ktestclient.NewListAction("imagestreams", "", nil, nil),
-		ktestclient.NewListAction("policybindings", "", nil, nil),
-		ktestclient.NewListAction("rolebindings", "", nil, nil),
-		ktestclient.NewListAction("roles", "", nil, nil),
-		ktestclient.NewListAction("routes", "", nil, nil),
-		ktestclient.NewListAction("templates", "", nil, nil),
-		ktestclient.NewListAction("builds", "", nil, nil),
-		ktestclient.NewListAction("namespace", "", nil, nil),
-		ktestclient.NewListAction("deploymentconfig", "", nil, nil),
+	expectedActionSet := []core.Action{
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "buildconfigs"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "policies"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "imagestreams"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "policybindings"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "rolebindings"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "roles"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "routes"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "templates"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "builds"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "namespace"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "deploymentconfig"}, "", kapi.ListOptions{}),
+		core.NewListAction(unversioned.GroupVersionResource{Group: "", Version: "v1", Resource: "egressnetworkpolicy"}, "", kapi.ListOptions{}),
 	}
-	actionSet := []ktestclient.Action{}
+	kubeActionSet := []core.Action{}
+	originActionSet := []core.Action{}
 	for i := range mockKubeClient.Actions() {
-		actionSet = append(actionSet, mockKubeClient.Actions()[i])
+		kubeActionSet = append(kubeActionSet, mockKubeClient.Actions()[i])
 	}
 	for i := range mockOriginClient.Actions() {
-		actionSet = append(actionSet, mockOriginClient.Actions()[i])
+		originActionSet = append(originActionSet, mockOriginClient.Actions()[i])
 	}
 
-	if len(actionSet) != len(expectedActionSet) {
-		t.Errorf("Expected actions: %v, but got: %v", expectedActionSet, actionSet)
+	if (len(kubeActionSet) + len(originActionSet)) != len(expectedActionSet) {
+		t.Errorf("Expected actions: %v, but got: %v and %v", expectedActionSet, originActionSet, kubeActionSet)
 	}
 }
 
 func TestSyncNamespaceThatIsActive(t *testing.T) {
-	mockKubeClient := &ktestclient.Fake{}
+	mockKubeClient := &fake.Clientset{}
 	mockOriginClient := &testclient.Fake{}
 	nm := NamespaceController{
 		KubeClient: mockKubeClient,
@@ -86,15 +90,16 @@ func TestSyncNamespaceThatIsActive(t *testing.T) {
 	if err != nil {
 		t.Errorf("Unexpected error when handling namespace %v", err)
 	}
-	actionSet := []ktestclient.Action{}
+	kubeActionSet := []core.Action{}
+	originActionSet := []core.Action{}
 	for i := range mockKubeClient.Actions() {
-		actionSet = append(actionSet, mockKubeClient.Actions()[i])
+		kubeActionSet = append(kubeActionSet, mockKubeClient.Actions()[i])
 	}
 	for i := range mockOriginClient.Actions() {
-		actionSet = append(actionSet, mockOriginClient.Actions()[i])
+		originActionSet = append(originActionSet, mockOriginClient.Actions()[i])
 	}
 
-	if len(actionSet) != 0 {
-		t.Errorf("Expected no action from controller, but got: %v", actionSet)
+	if (len(kubeActionSet) + len(originActionSet)) != 0 {
+		t.Errorf("Expected no actions from contoller, but got: %#v and %#v", originActionSet, kubeActionSet)
 	}
 }

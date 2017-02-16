@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"time"
 
-	"k8s.io/kubernetes/pkg/client"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/registry/service"
-	"k8s.io/kubernetes/pkg/util"
+	kapi "k8s.io/kubernetes/pkg/api"
+	kcoreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
+	"k8s.io/kubernetes/pkg/registry/core/rangeallocation"
+	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
+	utilwait "k8s.io/kubernetes/pkg/util/wait"
 
 	"github.com/openshift/origin/pkg/security"
 	"github.com/openshift/origin/pkg/security/uid"
@@ -24,14 +24,14 @@ import (
 //
 type Repair struct {
 	interval time.Duration
-	client   client.NamespaceInterface
-	alloc    service.RangeRegistry
+	client   kcoreclient.NamespaceInterface
+	alloc    rangeallocation.RangeRegistry
 	uidRange *uid.Range
 }
 
 // NewRepair creates a controller that periodically ensures that all UIDs labels that are allocated in the cluster
 // are claimed.
-func NewRepair(interval time.Duration, client client.NamespaceInterface, uidRange *uid.Range, alloc service.RangeRegistry) *Repair {
+func NewRepair(interval time.Duration, client kcoreclient.NamespaceInterface, uidRange *uid.Range, alloc rangeallocation.RangeRegistry) *Repair {
 	return &Repair{
 		interval: interval,
 		client:   client,
@@ -42,9 +42,9 @@ func NewRepair(interval time.Duration, client client.NamespaceInterface, uidRang
 
 // RunUntil starts the controller until the provided ch is closed.
 func (c *Repair) RunUntil(ch chan struct{}) {
-	util.Until(func() {
+	utilwait.Until(func() {
 		if err := c.RunOnce(); err != nil {
-			util.HandleError(err)
+			utilruntime.HandleError(err)
 		}
 	}, c.interval, ch)
 }
@@ -63,7 +63,7 @@ func (c *Repair) RunOnce() error {
 		return fmt.Errorf("unable to refresh the security allocation UID blocks: %v", err)
 	}
 
-	list, err := c.client.List(labels.Everything(), fields.Everything())
+	list, err := c.client.List(kapi.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("unable to refresh the security allocation UID blocks: %v", err)
 	}
@@ -81,6 +81,8 @@ func (c *Repair) RunOnce() error {
 		}
 		switch err := uids.Allocate(block); err {
 		case nil:
+		case uidallocator.ErrNotInRange, uidallocator.ErrAllocated:
+			continue
 		case uidallocator.ErrFull:
 			// TODO: send event
 			return fmt.Errorf("the UID range %s is full; you must widen the range in order to allocate more UIDs", c.uidRange)

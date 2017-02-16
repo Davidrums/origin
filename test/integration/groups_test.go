@@ -1,10 +1,12 @@
-// +build integration,etcd
-
 package integration
 
 import (
+	"io"
 	"reflect"
 	"testing"
+
+	kapi "k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/runtime"
 
 	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
 	groupscmd "github.com/openshift/origin/pkg/cmd/admin/groups"
@@ -12,10 +14,13 @@ import (
 	userapi "github.com/openshift/origin/pkg/user/api"
 	uservalidation "github.com/openshift/origin/pkg/user/api/validation"
 	testutil "github.com/openshift/origin/test/util"
+	testserver "github.com/openshift/origin/test/util/server"
 )
 
 func TestBasicUserBasedGroupManipulation(t *testing.T) {
-	_, clusterAdminKubeConfig, err := testutil.StartTestMaster()
+	testutil.RequireEtcd(t)
+	defer testutil.DumpEtcdOnFailure(t)
+	_, clusterAdminKubeConfig, err := testserver.StartTestMasterAPI()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -89,7 +94,7 @@ func TestBasicUserBasedGroupManipulation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := testutil.WaitForPolicyUpdate(valerieOpenshiftClient, "empty", "get", "pods", true); err != nil {
+	if err := testutil.WaitForPolicyUpdate(valerieOpenshiftClient, "empty", "get", kapi.Resource("pods"), true); err != nil {
 		t.Error(err)
 	}
 
@@ -102,7 +107,9 @@ func TestBasicUserBasedGroupManipulation(t *testing.T) {
 }
 
 func TestBasicGroupManipulation(t *testing.T) {
-	_, clusterAdminKubeConfig, err := testutil.StartTestMaster()
+	testutil.RequireEtcd(t)
+	defer testutil.DumpEtcdOnFailure(t)
+	_, clusterAdminKubeConfig, err := testserver.StartTestMasterAPI()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -149,7 +156,7 @@ func TestBasicGroupManipulation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := testutil.WaitForPolicyUpdate(valerieOpenshiftClient, "empty", "get", "pods", true); err != nil {
+	if err := testutil.WaitForPolicyUpdate(valerieOpenshiftClient, "empty", "get", kapi.Resource("pods"), true); err != nil {
 		t.Error(err)
 	}
 
@@ -171,7 +178,9 @@ func TestBasicGroupManipulation(t *testing.T) {
 }
 
 func TestGroupCommands(t *testing.T) {
-	_, clusterAdminKubeConfig, err := testutil.StartTestMaster()
+	testutil.RequireEtcd(t)
+	defer testutil.DumpEtcdOnFailure(t)
+	_, clusterAdminKubeConfig, err := testserver.StartTestMasterAPI()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -181,7 +190,14 @@ func TestGroupCommands(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	newGroup := &groupscmd.NewGroupOptions{clusterAdminClient.Groups(), "group1", []string{"first", "second", "third", "first"}}
+	newGroup := &groupscmd.NewGroupOptions{
+		GroupClient: clusterAdminClient.Groups(),
+		Group:       "group1",
+		Users:       []string{"first", "second", "third", "first"},
+		Printer: func(runtime.Object, io.Writer) error {
+			return nil
+		},
+	}
 	if err := newGroup.AddGroup(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -193,7 +209,11 @@ func TestGroupCommands(t *testing.T) {
 		t.Errorf("expected %v, actual %v", e, a)
 	}
 
-	modifyUsers := &groupscmd.GroupModificationOptions{clusterAdminClient.Groups(), "group1", []string{"second", "fourth", "fifth"}}
+	modifyUsers := &groupscmd.GroupModificationOptions{
+		GroupClient: clusterAdminClient.Groups(),
+		Group:       "group1",
+		Users:       []string{"second", "fourth", "fifth"},
+	}
 	if err := modifyUsers.AddUsers(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

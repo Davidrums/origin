@@ -6,34 +6,38 @@ import (
 	"io"
 
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/sets"
 
 	"github.com/spf13/cobra"
 
 	"github.com/openshift/origin/pkg/client"
+	"github.com/openshift/origin/pkg/cmd/templates"
 	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
 )
 
 const (
-	AddRecommendedName = "add-users"
-	addLong            = `
-Add users to a group.
-
-This command will append unique users to the list of members for a group.`
-
-	addExample = `  // Add user1 and user2 to my-group
-  $ %[1]s my-group user1 user2`
+	AddRecommendedName    = "add-users"
+	RemoveRecommendedName = "remove-users"
 )
 
-const (
-	RemoveRecommendedName = "remove-users"
-	removeLong            = `
-Remove users from a group.
+var (
+	addLong = templates.LongDesc(`
+		Add users to a group.
 
-This command will remove users from the list of members for a group.`
+		This command will append unique users to the list of members for a group.`)
 
-	removeExample = `  // Remove user1 and user2 from my-group
-  $ %[1]s my-group user1 user2`
+	addExample = templates.Examples(`
+		# Add user1 and user2 to my-group
+  	%[1]s my-group user1 user2`)
+
+	removeLong = templates.LongDesc(`
+		Remove users from a group.
+
+		This command will remove users from the list of members for a group.`)
+
+	removeExample = templates.Examples(`
+		# Remove user1 and user2 from my-group
+  	%[1]s my-group user1 user2`)
 )
 
 type GroupModificationOptions struct {
@@ -85,7 +89,7 @@ func NewCmdRemoveUsers(name, fullName string, f *clientcmd.Factory, out io.Write
 
 func (o *GroupModificationOptions) Complete(f *clientcmd.Factory, args []string) error {
 	if len(args) < 2 {
-		return errors.New("You must specify at least two arguments: GROUP USER [USER ...]")
+		return errors.New("you must specify at least two arguments: GROUP USER [USER ...]")
 	}
 
 	o.Group = args[0]
@@ -107,7 +111,7 @@ func (o *GroupModificationOptions) AddUsers() error {
 		return err
 	}
 
-	existingUsers := util.NewStringSet(group.Users...)
+	existingUsers := sets.NewString(group.Users...)
 	for _, user := range o.Users {
 		if existingUsers.Has(user) {
 			continue
@@ -126,7 +130,7 @@ func (o *GroupModificationOptions) RemoveUsers() error {
 		return err
 	}
 
-	toDelete := util.NewStringSet(o.Users...)
+	toDelete := sets.NewString(o.Users...)
 	newUsers := []string{}
 	for _, user := range group.Users {
 		if toDelete.Has(user) {

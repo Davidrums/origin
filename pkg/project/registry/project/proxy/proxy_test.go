@@ -1,17 +1,16 @@
 package proxy
 
 import (
-	//  "fmt"
 	"strings"
 	"testing"
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/errors"
+	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/auth/user"
-	"k8s.io/kubernetes/pkg/client/testclient"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
 
+	oapi "github.com/openshift/origin/pkg/api"
 	"github.com/openshift/origin/pkg/project/api"
 )
 
@@ -32,9 +31,9 @@ func TestListProjects(t *testing.T) {
 			},
 		},
 	}
-	mockClient := testclient.NewSimpleFake(&namespaceList)
+	mockClient := fake.NewSimpleClientset(&namespaceList)
 	storage := REST{
-		client: mockClient.Namespaces(),
+		client: mockClient.Core().Namespaces(),
 		lister: &mockLister{&namespaceList},
 	}
 	user := &user.DefaultInfo{
@@ -43,7 +42,7 @@ func TestListProjects(t *testing.T) {
 		Groups: []string{"test-groups"},
 	}
 	ctx := kapi.WithUser(kapi.NewContext(), user)
-	response, err := storage.List(ctx, labels.Everything(), fields.Everything())
+	response, err := storage.List(ctx, nil)
 	if err != nil {
 		t.Errorf("%#v should be nil.", err)
 	}
@@ -70,11 +69,11 @@ func TestCreateProjectBadObject(t *testing.T) {
 }
 
 func TestCreateInvalidProject(t *testing.T) {
-	mockClient := &testclient.Fake{}
-	storage := NewREST(mockClient.Namespaces(), &mockLister{})
-	_, err := storage.Create(nil, &api.Project{
+	mockClient := &fake.Clientset{}
+	storage := NewREST(mockClient.Core().Namespaces(), &mockLister{}, nil, nil)
+	_, err := storage.Create(kapi.NewContext(), &api.Project{
 		ObjectMeta: kapi.ObjectMeta{
-			Annotations: map[string]string{"openshift.io/display-name": "h\t\ni"},
+			Annotations: map[string]string{oapi.OpenShiftDisplayName: "h\t\ni"},
 		},
 	})
 	if !errors.IsInvalid(err) {
@@ -83,8 +82,8 @@ func TestCreateInvalidProject(t *testing.T) {
 }
 
 func TestCreateProjectOK(t *testing.T) {
-	mockClient := &testclient.Fake{}
-	storage := NewREST(mockClient.Namespaces(), &mockLister{})
+	mockClient := &fake.Clientset{}
+	storage := NewREST(mockClient.Core().Namespaces(), &mockLister{}, nil, nil)
 	_, err := storage.Create(kapi.NewContext(), &api.Project{
 		ObjectMeta: kapi.ObjectMeta{Name: "foo"},
 	})
@@ -100,8 +99,8 @@ func TestCreateProjectOK(t *testing.T) {
 }
 
 func TestGetProjectOK(t *testing.T) {
-	mockClient := testclient.NewSimpleFake(&kapi.Namespace{ObjectMeta: kapi.ObjectMeta{Name: "foo"}})
-	storage := NewREST(mockClient.Namespaces(), &mockLister{})
+	mockClient := fake.NewSimpleClientset(&kapi.Namespace{ObjectMeta: kapi.ObjectMeta{Name: "foo"}})
+	storage := NewREST(mockClient.Core().Namespaces(), &mockLister{}, nil, nil)
 	project, err := storage.Get(kapi.NewContext(), "foo")
 	if project == nil {
 		t.Error("Unexpected nil project")
@@ -115,9 +114,9 @@ func TestGetProjectOK(t *testing.T) {
 }
 
 func TestDeleteProject(t *testing.T) {
-	mockClient := &testclient.Fake{}
+	mockClient := &fake.Clientset{}
 	storage := REST{
-		client: mockClient.Namespaces(),
+		client: mockClient.Core().Namespaces(),
 	}
 	obj, err := storage.Delete(kapi.NewContext(), "foo")
 	if obj == nil {
@@ -126,11 +125,11 @@ func TestDeleteProject(t *testing.T) {
 	if err != nil {
 		t.Errorf("Unexpected non-nil error: %#v", err)
 	}
-	status, ok := obj.(*kapi.Status)
+	status, ok := obj.(*unversioned.Status)
 	if !ok {
 		t.Errorf("Expected status type, got: %#v", obj)
 	}
-	if status.Status != kapi.StatusSuccess {
+	if status.Status != unversioned.StatusSuccess {
 		t.Errorf("Expected status=success, got: %#v", status)
 	}
 	if len(mockClient.Actions()) != 1 {

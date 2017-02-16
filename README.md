@@ -1,185 +1,176 @@
 OpenShift Application Platform
 ==============================
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/openshift/origin)](https://goreportcard.com/report/github.com/openshift/origin)
 [![GoDoc](https://godoc.org/github.com/openshift/origin?status.png)](https://godoc.org/github.com/openshift/origin)
 [![Travis](https://travis-ci.org/openshift/origin.svg?branch=master)](https://travis-ci.org/openshift/origin)
+[![Jenkins](https://ci.openshift.redhat.com/jenkins/buildStatus/icon?job=devenv_ami)](https://ci.openshift.redhat.com/jenkins/job/devenv_ami/)
+[![Join the chat at freenode:openshift-dev](https://img.shields.io/badge/irc-freenode%3A%20%23openshift--dev-blue.svg)](http://webchat.freenode.net/?channels=%23openshift-dev)
+[![Licensed under Apache License version 2.0](https://img.shields.io/github/license/openshift/origin.svg?maxAge=2592000)](https://www.apache.org/licenses/LICENSE-2.0)
 
-This is the source repository for [OpenShift Origin](https://openshift.github.io), based on top of 
-[Docker](https://www.docker.io) containers and the
-[Kubernetes](https://github.com/kubernetes/kubernetes) container cluster manager.
-Origin is a distribution of Kubernetes optimized for enterprise application development and deployment, 
-used by OpenShift 3 and Atomic Enterprise.  OpenShift adds developer and operational centric tools 
-on top of Kubernetes to enable rapid application development,
-easy deployment and scaling, and long-term lifecycle maintenance for small and large teams and applications.
+***OpenShift Origin*** is a distribution of [Kubernetes](https://kubernetes.io) optimized for continuous application development and multi-tenant deployment.  OpenShift adds developer and operations-centric tools on top of Kubernetes to enable rapid application development, easy deployment and scaling, and long-term lifecycle maintenance for small and large teams.
+
+[![Watch the full asciicast](docs/openshift-intro.gif)](https://asciinema.org/a/49402)
 
 **Features:**
 
-* Build web-scale applications with integrated service discovery, DNS, load balancing, failover, health checking, persistent storage, and fast scaling
-* Push source code to your Git repository and have image builds and deployments automatically occur
-* Easy to use client tools for building web applications from source code
-  * Templatize the components of your system, reuse them, and iteratively deploy them over time
-* Centralized administration and management of application component libraries
-  * Roll out changes to software stacks to your entire organization in a controlled fashion
-* Team and user isolation of containers, builds, and network communication in an easy multi-tenancy system
-  * Allow developers to run containers securely by preventing root access and isolating containers with SELinux
-  * Limit, track, and manage the resources teams are using
+* Easily build applications with integrated service discovery and persistent storage.
+* Quickly and easily scale applications to handle periods of increased demand.
+  * Support for automatic high availability, load balancing, health checking, and failover.
+* Push source code to your Git repository and automatically deploy containerized applications.
+* Web console and command-line client for building and monitoring applications.
+* Centralized administration and management of an entire stack, team, or organization.
+  * Create reusable templates for components of your system, and iteratively deploy them over time.
+  * Roll out modifications to software stacks to your entire organization in a controlled fashion.
+  * Integration with your existing authentication mechanisms, including LDAP, Active Directory, and public OAuth providers such as GitHub.
+* Multi-tenancy support, including team and user isolation of containers, builds, and network communication.
+  * Allow developers to run containers securely with fine-grained controls in production.
+  * Limit, track, and manage the developers and teams on the platform.
+* Integrated Docker registry, automatic edge load balancing, cluster logging, and integrated metrics.
 
 **Learn More:**
 
-* **[Public Documentation](http://docs.openshift.org/latest/welcome/index.html)**
-* The **[Trello Roadmap](https://ci.openshift.redhat.com/roadmap_overview.html)** covers the epics and stories being worked on (click through to individual items)
-* **[Technical Architecture Presentation](https://docs.google.com/presentation/d/1Isp5UeQZTo3gh6e59FMYmMs_V9QIQeBelmbyHIJ1H_g/pub?start=false&loop=false&delayms=3000)**
-* **[System Architecture](https://github.com/openshift/openshift-pep/blob/master/openshift-pep-013-openshift-3.md)** design document
+* **[Public Documentation](https://docs.openshift.org/latest/welcome/)**
+  * **[API Documentation](https://docs.openshift.org/latest/rest_api/openshift_v1.html)**
+* Our **[Trello Roadmap](https://ci.openshift.redhat.com/roadmap_overview.html)** covers the epics and stories being worked on (click through to individual items)
 
 For questions or feedback, reach us on [IRC on #openshift-dev](https://botbot.me/freenode/openshift-dev/) on Freenode or post to our [mailing list](https://lists.openshift.redhat.com/openshiftmm/listinfo/dev).
 
-NOTE: Origin 1.0 has been released [releases page](https://github.com/openshift/origin/releases). Feedback, suggestions, and testing are all welcome!
-
-
-Security!!!
--------------------
-Origin runs with the following security policy by default:
-
-* Containers run as a non-root unique user that is separate from other system users
-  * They cannot access host resources, run privileged, or become root
-  * They are given CPU and memory limits defined by the system administrator
-  * Any persistent storage they access will be under a unique SELinux label, which prevents others from seeing their content
-  * These settings are per project, so containers in different projects cannot see each other by default
-* Regular users can run Docker, source, and custom builds
-  * By default, Docker builds can (and often do) run as root. You can control who can create Docker builds through the `builds/docker` and `builds/custom` policy resource.
-* Regular users and project admins cannot change their security quotas.
-
-See the [security documentation](https://docs.openshift.org/latest/admin_guide/manage_scc.html) for more on managing these restrictions.
-
 Getting Started
 ---------------
-The easiest way to run Origin is in a Docker container (Origin requires Docker 1.6.2 or higher).
-If you'd like to get started with Atomic Enterprise please refer to the [quickstart guide](docs/atomic-quick-start-tutorial.adoc).
 
-You'll need to configure the Docker daemon on your host to trust the Docker registry service you'll be starting.
+### Installation
 
-To do this, you need to add "--insecure-registry 172.30.0.0/16" to the Docker daemon invocation, eg:
+If you have downloaded the client tools from the [releases page](https://github.com/openshift/origin/releases), place the included binaries in your PATH.
 
-    $ docker -d --insecure-registry 172.30.0.0/16
+* On any system with a Docker engine installed, you can run `oc cluster up` to get started immediately.  Try it out now!
+* For a full cluster installation using [Ansible](https://github.com/openshift/openshift-ansible), follow the [Advanced Installation guide](https://docs.openshift.org/latest/install_config/install/advanced_install.html)
+* To build and run from source, see [CONTRIBUTING.adoc](CONTRIBUTING.adoc)
 
-If you are running Docker as a service via `systemd`, you can add this argument to the options value in `/etc/sysconfig/docker`
+### Concepts
 
-This will instruct the Docker daemon to trust any Docker registry on the 172.30.0.0/16 subnet,
-rather than requiring the registry to have a verifiable certificate.
+OpenShift builds a developer-centric workflow around Docker containers and Kubernetes runtime concepts.  An **Image Stream** lets you easily tag, import, and publish Docker images from the integrated registry.  A **Build Config** allows you to launch Docker builds, build directly from source code, or trigger Jenkins Pipeline jobs whenever an image stream tag is updated.  A **Deployment Config** allows you to redeploy whenever a new image becomes available.  **Routes** make it trivial to expose your Kubernetes services via a public DNS name. As an administrator, you can enable your developers to request new **Projects** which come with predefined roles, quotas, and security controls to fairly divide access.
 
-**Important!**: Docker on non-RedHat distributions (Ubuntu, Debian, boot2docker) has mount propagation PRIVATE, which [breaks](https://github.com/openshift/origin/issues/3072) running Origin inside a container. Please use the [Vagrant](CONTRIBUTING.adoc#develop-on-virtual-machine-using-vagrant) or binary installation paths on those distributions.
+For more on the underlying concepts of OpenShift, please see the [documentation site](https://docs.openshift.org/latest/welcome/index.html).
 
-    $ sudo docker run -d --name "origin" \
-        --privileged --net=host \
-        -v /:/rootfs:ro -v /var/run:/var/run:rw -v /sys:/sys:ro -v /var/lib/docker:/var/lib/docker:rw \
-        -v /var/lib/openshift/openshift.local.volumes:/var/lib/openshift/openshift.local.volumes \
-        openshift/origin start
+### OpenShift API
 
-**Security!** Why do we need to mount your host, run privileged, and get access to your Docker directory? Origin runs as a host agent (like Docker)
-and starts and stops Docker containers, mounts remote volumes, and monitors the system (/sys) to report performance and health info. You can strip all of these options off and Origin will still start, but you won't be able to run pods (which is kind of the point).
+The OpenShift API is located on each server at `https://<host>:8443/oapi/v1`. These APIs are described via [Swagger v1.2](https://www.swagger.io) at `https://<host>:8443/swaggerapi/oapi/v1`. For more, [see the API documentation](https://docs.openshift.org/latest/rest_api/openshift_v1.html).
 
-Once the container is started, you can jump into a console inside the container and run the CLI.
+### Kubernetes
 
-    $ sudo docker exec -it origin bash
+OpenShift embeds Kubernetes and extends it with security and other integrated concepts.  An OpenShift Origin release corresponds to the Kubernetes distribution - for example, OpenShift 1.4 includes Kubernetes 1.4.
 
-    # Start the integrated registry in a container
-    $ oadm registry --credentials=./openshift.local.config/master/openshift-registry.kubeconfig
+If you're looking for more information about using Kubernetes or the lower level concepts that Origin depends on, see the following:
 
-    # Use the CLI to login, create a project, and then create your app.
-    $ oc --help
-    $ oc login
-    Username: test
-    Password: test
-    $ oc new-project test
-    $ oc new-app -f https://raw.githubusercontent.com/openshift/origin/master/examples/sample-app/application-template-stibuild.json
-
-    # See everything you just created!
-    $ oc status
-
-Any username and password are accepted by default (with no credential system configured).  You can view the webconsole at [https://localhost:8443/console](https://localhost:8443/console) in your browser - login with the same credentials you used above and you'll see the application you just created.
-
-![Web console overview](docs/screenshots/console_overview.png?raw=true)
-
-You can also use the Docker container to run our CLI (`sudo docker exec -it origin cli --help`) or download the `oc` command-line client from the [releases](https://github.com/openshift/origin/releases) page for Mac, Windows, or Linux and login from your host with `oc login`.
-
-You can reset your server by stopping the `origin` container and then removing it via Docker. The contents of `/var/lib/openshift` can then be removed. See the [public docs](http://docs.openshift.org/latest/welcome/index.html) for more about running a permanent installation of OpenShift.
+* [Kubernetes Getting Started](https://kubernetes.io/docs/tutorials/kubernetes-basics/)
+* [Kubernetes Documentation](https://kubernetes.io/docs/)
+* [Kubernetes API](https://docs.openshift.org/latest/rest_api/kubernetes_v1.html)
 
 
-### Next Steps
+### What can I run on OpenShift?
 
-We highly recommend trying out the [Origin walkthrough](https://github.com/openshift/origin/blob/master/examples/sample-app/README.md), which shows some of the lower level pieces of Origin that will be the foundation for user applications.  The walkthrough is accompanied by a blog series on [blog.openshift.com](https://blog.openshift.com/openshift-v3-deep-dive-docker-kubernetes/) that goes into more detail.  It's a great place to start, albeit at a lower level than OpenShift 2.
+OpenShift is designed to run any existing Docker images.  Additionally, you can define builds that will produce new Docker images using a `Dockerfile`.
 
-Both Origin and Kubernetes have a strong focus on documentation - see the following for more information about them:
+For an easier experience running your source code, [Source-to-Image (S2I)](https://github.com/openshift/source-to-image) allows developers to simply provide an application source repository containing code to build and run.  It works by combining an existing S2I-enabled Docker image with application source to produce a new runnable image for your application.
 
-* [Origin Documentation](http://docs.openshift.org/latest/welcome/index.html)
-* [Kubernetes Getting Started](https://github.com/kubernetes/kubernetes/blob/master/README.md)
-* [Kubernetes Documentation](https://github.com/kubernetes/kubernetes/blob/master/docs/README.md)
+You can see the [full list of Source-to-Image builder images](https://docs.openshift.org/latest/using_images/s2i_images/overview.html) and it's straightforward to [create your own](https://blog.openshift.com/create-s2i-builder-image/).  Some of our available images include:
 
+  * [Ruby](https://github.com/sclorg/s2i-ruby-container)
+  * [Python](https://github.com/sclorg/s2i-python-container)
+  * [Node.js](https://github.com/sclorg/s2i-nodejs-container)
+  * [PHP](https://github.com/sclorg/s2i-php-container)
+  * [Perl](https://github.com/sclorg/s2i-perl-container)
+  * [WildFly](https://github.com/openshift-s2i/s2i-wildfly)
 
-### Troubleshooting
+Your application image can be easily extended with a database service with our [database images](https://docs.openshift.org/latest/using_images/db_images/overview.html):
 
-If you run into difficulties running Origin, start by reading through the [troubleshooting guide](https://github.com/openshift/origin/blob/master/docs/debugging-openshift.md).
+  * [MySQL](https://github.com/sclorg/mysql-container)
+  * [MongoDB](https://github.com/sclorg/mongodb-container)
+  * [PostgreSQL](https://github.com/sclorg/postgresql-container)
 
+### What sorts of security controls does OpenShift provide for containers?
 
-API
----
+OpenShift runs with the following security policy by default:
 
-The Origin APIs are exposed at `https://localhost:8443/oapi/v1/*`.
+  * Containers run as a non-root unique user that is separate from other system users
+    * They cannot access host resources, run privileged, or become root
+    * They are given CPU and memory limits defined by the system administrator
+    * Any persistent storage they access will be under a unique SELinux label, which prevents others from seeing their content
+    * These settings are per project, so containers in different projects cannot see each other by default
+  * Regular users can run Docker, source, and custom builds
+    * By default, Docker builds can (and often do) run as root. You can control who can create Docker builds through the `builds/docker` and `builds/custom` policy resource.
+  * Regular users and project admins cannot change their security quotas.
 
-To experiment with the API, you can get a token to act as a user:
+Many Docker containers expect to run as root (and therefore edit all the contents of the filesystem). The [Image Author's guide](https://docs.openshift.org/latest/creating_images/guidelines.html#openshift-specific-guidelines) gives recommendations on making your image more secure by default:
 
-    $ sudo docker exec -it openshift-origin bash
-    $ oc login
-    Username: test
-    Password: test
-    $ oc whoami -t
-    <prints a token>
-    $ exit
-    # from your host
-    $ curl -H "Authorization: bearer <token>" https://localhost:8443/oapi/v1/...
+    * Don't run as root
+    * Make directories you want to write to group-writable and owned by group id 0
+    * Set the net-bind capability on your executables if they need to bind to ports &lt;1024
 
+If you are running your own cluster and want to run a container as root, you can grant that permission to the containers in your current project with the following command:
 
-### API Documentation
+    # Gives the default service account in the current project access to run as UID 0 (root)
+    oc adm add-scc-to-user anyuid -z default 
 
-The API documentation can be found [here](http://docs.openshift.org/latest/rest_api/openshift_v1.html).
-
-
-FAQ
----
-
-1. How does Origin relate to Kubernetes?
-
-    Origin is a distribution of Kubernetes optimized for enterprise application development and deployment, 
-    used by OpenShift 3 and Atomic Enterprise.  Origin embeds Kubernetes and adds additional 
-    functionality to offer a simple, powerful, and easy-to-approach developer and operator experience 
-    for building applications in containers.  Our goal is to do most of that work upstream, with 
-    integration and final packaging occurring in Origin.
+See the [security documentation](https://docs.openshift.org/latest/admin_guide/manage_scc.html) more on confining applications.
 
 
-2. How does Atomic Enterprise relate to Origin and OpenShift?
-         
-    Two products are built from Origin, Atomic Enterprise and OpenShift. Atomic Enterprise adds 
-    operational centric tools to enable easy deployment and scaling and long-term lifecycle 
-    maintenance for small and large teams and applications. OpenShift provides a number of 
-    developer-focused tools on top of Atomic Enterprise such as image building, management, and 
-    enhanced deployment flows.  
-    
-3. What can I run on Origin?
+Support for Kubernetes Alpha Features
+-----------------------------------------
 
-    Origin is designed to run any existing Docker images.  In addition you can define builds that will produce new Docker images from a Dockerfile.  However the real magic of Origin can be seen when using [Source-To-Image](https://github.com/openshift/source-to-image) builds which allow you to simply supply an application source repository which will be combined with an existing Source-To-Image enabled Docker image to produce a new runnable image that runs your application.  We are continuing to grow the ecosystem of Source-To-Image enabled images and documenting them [here](http://docs.openshift.org/latest/using_images/s2i_images/overview.html). Our available images are:
+Some features from upstream Kubernetes are not yet enabled in OpenShift, for reasons including supportability, security, or limitations in the upstream feature.
 
-    * [Ruby](https://github.com/openshift/sti-ruby)
-    * [Python](https://github.com/openshift/sti-python)
-    * [NodeJS](https://github.com/openshift/sti-nodejs)
-    * [PHP](https://github.com/openshift/sti-php)
-    * [Perl](https://github.com/openshift/sti-perl)
-    * [Wildfly](https://github.com/openshift/wildfly-8-centos)
+Kubernetes Definitions:
 
-    Your application image can be easily extended with a database service with our [database images](http://docs.openshift.org/latest/using_images/db_images/overview.html). Our available database images are:
+* Alpha
+  * The feature is available, but no guarantees are made about backwards compatibility or whether data is preserved when feature moves to Beta.
+  * The feature may have significant bugs and is suitable for testing and prototyping.
+  * The feature may be replaced or significantly redesigned in the future.
+  * No migration to Beta is generally provided other than documentation of the change.
+* Beta
+  * The feature is available and generally agreed to solve the desired solution, but may need stabilization or additional feedback.
+  * The feature is potentially suitable for limited production use under constrained circumstances.
+  * The feature is unlikely to be replaced or removed, although it is still possible for feature changes that require migration.
 
-    * [MySQL](https://github.com/openshift/mysql)
-    * [MongoDB](https://github.com/openshift/mongodb)
-    * [PostgreSQL](https://github.com/openshift/postgresql)
+OpenShift uses these terms in the same fashion as Kubernetes, and adds four more:
+
+* Not Yet Secure
+  * Features which are not yet enabled because they have significant security or stability risks to the cluster
+  * Generally this applies to features which may allow escalation or denial-of-service behavior on the platform
+  * In some cases this is applied to new features which have not had time for full security review
+* Potentially Insecure
+  * Features that require additional work to be properly secured in a multi-user environment
+  * These features are only enabled for cluster admins by default and we do not recommend enabling them for untrusted users
+  * We generally try to identify and fix these within 1 release of their availability
+* Tech Preview
+  * Features that are considered unsupported for various reasons are known as 'tech preview' in our documentation
+  * Kubernetes Alpha and Beta features are considered tech preview, although occasionally some features will be graduated early
+  * Any tech preview feature is not supported in OpenShift Container Platform except through exemption
+* Disabled Pending Migration
+  * These are features that are new in Kubernetes but which originated in OpenShift, and thus need migrations for existing users
+  * We generally try to minimize the impact of features introduced upstream to Kubernetes on OpenShift users by providing seamless
+    migration for existing clusters.
+  * Generally these are addressed within 1 Kubernetes release
+
+The list of features that qualify under these labels is described below, along with additional context for why.
+
+Feature | Kubernetes | OpenShift | Justification
+------- | ---------- | --------- | -------------
+Third Party Resources | Alpha (1.4, 1.5) | Not Yet Secure | Third party resources are still under active development upstream.<br>Known issues include failure to clean up resources in etcd, which may result in a denial of service attack against the cluster.<br>We are considering enabling them for development environments only.
+Garbage Collection | Alpha (1.3)<br>Beta (1.4, 1.5) | Tech Preview (1.4, 1.5) | Garbage collection will automatically delete related resources on the server, and thus given the potential for data loss we are waiting for GC to graduate to beta and have a full release cycle of testing before enabling it in Origin.
+Stateful Sets | Alpha (1.3, 1.4)<br>Beta (1.5) | Tech Preview (1.3, 1.4, 1.5) | Stateful Sets are still being actively developed and no backwards compatibility is guaranteed until 1.5 is released. Starting in 1.5, Stateful Sets will be enabled by default and some backwards compatibility will be guaranteed.
+Init Containers | Alpha (1.3, 1.4)<br>Beta(1.5) | Tech Preview (1.3, 1.4, 1.5) | Init containers are properly secured, but will not be officially supported until 1.6.
+Federated Clusters | Alpha (1.3)<br>Beta (1.4, 1.5) | Tech Preview (1.3, 1.4, 1.5) | A Kubernetes federation server may be used against Origin clusters with the appropriate credentials today.<br>Known issues include tenant support in federation and the ability to have consistent access control between federation and normal clusters.<br>No Origin specific binary is being distributed for federation at this time.
+Deployment | Beta (1.3, 1.4, 1.5) | Tech Preview (1.3, 1.4, 1.5) | OpenShift launched with DeploymentConfigs, a more fully featured Deployment object. DeploymentConfigs are more appropriate for developer flows where you want to push code and have it automatically be deployed, and also provide more advanced hooks and custom deployments.  Use Kubernetes Deployments when you are managing change outside of OpenShift.
+Replica Sets | Beta (1.3, 1.4, 1.5) | Tech Preview (1.3, 1.4, 1.5) | Replica Sets perform the same function as Replication Controllers, but have a more powerful label syntax. Both ReplicationControllers and ReplicaSets can be used.  
+Ingress | Beta (1.2, 1.3, 1.4, 1.5) | Tech Preview (1.3, 1.4, 1.5) | OpenShift launched with Routes, a more full featured Ingress object. In 1.5, Ingress rules can be read by the router (disabled by default), but because Ingress objects reference secrets you must grant the routers a very level of access to your cluster to run with them.  Future changes will likely reduce the security impact of enabling Ingress.
+PodSecurityPolicy | Beta (1.3, 1.4, 1.5) | Tech Preview (1.3, 1.4, 1.5) | OpenShift launched with SecurityContextConstraints, and then upstreamed them as PodSecurityPolicy. We plan to enable upstream PodSecurityPolicy so as to automatically migrate existing SecurityContextConstraints. PodSecurityPolicy has not yet completed a full security review, which will be part of the criteria for tech preview. <br>SecurityContextConstraints are a superset of PodSecurityPolicy features.
+PodAntiAffinitySelectors | Beta (1.3, 1.4, 1.5) | Not Yet Secure (1.3)<br>Tech Preview (1.4, 1.5) | End users are not allowed to set PodAntiAffinitySelectors that are not the node name due to the possibility of attacking the scheduler via denial of service.
+NetworkPolicy | Beta (1.3, 1.4, 1.5) | Tech Preview (1.3, 1.4, 1.5) | Starting with 1.5, OpenShift SDN will expose an experimental mode that uses network policy to restrict access to pods.  Future releases will expand this support.
+
+Please contact us if this list omits a feature supported in Kubernetes which does not run in Origin.
+
 
 Contributing
 ------------
@@ -195,10 +186,10 @@ See [HACKING.md](https://github.com/openshift/origin/blob/master/HACKING.md) for
 If you want to run the test suite, make sure you have your environment set up, and from the `origin` directory run:
 
 ```
-# run the unit tests
+# run the verifiers, unit tests, and command tests
 $ make check
 
-# run a simple server integration test
+# run a command-line integration test suite
 $ hack/test-cmd.sh
 
 # run the integration server test suite
@@ -217,7 +208,7 @@ You'll need [etcd](https://github.com/coreos/etcd) installed and on your path fo
 $ hack/install-etcd.sh
 ```
 
-Some of the components of Origin run as Docker images, including the builders and deployment tools in `images/builder/docker/*` and 'images/deploy/*`.  To build them locally run
+Some of the components of Origin run as Docker images, including the builders and deployment tools in `images/builder/docker/*` and `images/deploy/*`.  To build them locally run
 
 ```
 $ hack/build-images.sh
@@ -225,8 +216,14 @@ $ hack/build-images.sh
 
 To hack on the web console, check out the [assets/README.md](assets/README.md) file for instructions on testing the console and building your changes.
 
+Security Response
+-----------------
+If you've found a security issue that you'd like to disclose confidentially
+please contact Red Hat's Product Security team. Details at
+https://access.redhat.com/security/team/contact
+
 
 License
 -------
 
-Origin is licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/).
+OpenShift is licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/).

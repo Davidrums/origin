@@ -7,18 +7,22 @@ import (
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/meta"
+	"k8s.io/kubernetes/pkg/apimachinery/registered"
+	"k8s.io/kubernetes/pkg/apis/autoscaling"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
 	"k8s.io/kubernetes/pkg/runtime"
 
 	osgraph "github.com/openshift/origin/pkg/api/graph"
+	_ "github.com/openshift/origin/pkg/api/install"
 	kubegraph "github.com/openshift/origin/pkg/api/kubegraph/nodes"
-	"github.com/openshift/origin/pkg/api/latest"
 	buildapi "github.com/openshift/origin/pkg/build/api"
 	buildgraph "github.com/openshift/origin/pkg/build/graph/nodes"
 	deployapi "github.com/openshift/origin/pkg/deploy/api"
 	deploygraph "github.com/openshift/origin/pkg/deploy/graph/nodes"
 	imageapi "github.com/openshift/origin/pkg/image/api"
 	imagegraph "github.com/openshift/origin/pkg/image/graph/nodes"
+	routeapi "github.com/openshift/origin/pkg/route/api"
+	routegraph "github.com/openshift/origin/pkg/route/graph/nodes"
 )
 
 // typeToEnsureMethod stores types to Ensure*Node methods
@@ -40,6 +44,10 @@ func init() {
 	if err := RegisterEnsureNode(&buildapi.Build{}, buildgraph.EnsureBuildNode); err != nil {
 		panic(err)
 	}
+	if err := RegisterEnsureNode(&routeapi.Route{}, routegraph.EnsureRouteNode); err != nil {
+		panic(err)
+	}
+
 	if err := RegisterEnsureNode(&kapi.Pod{}, kubegraph.EnsurePodNode); err != nil {
 		panic(err)
 	}
@@ -54,6 +62,11 @@ func init() {
 	}
 	if err := RegisterEnsureNode(&kapi.ReplicationController{}, kubegraph.EnsureReplicationControllerNode); err != nil {
 		panic(err)
+	}
+	if err := RegisterEnsureNode(&kapi.PersistentVolumeClaim{}, kubegraph.EnsurePersistentVolumeClaimNode); err != nil {
+		panic(err)
+	}
+	if err := RegisterEnsureNode(&autoscaling.HorizontalPodAutoscaler{}, kubegraph.EnsureHorizontalPodAutoscalerNode); err != nil {
 	}
 }
 
@@ -117,14 +130,14 @@ func BuildGraph(path string) (osgraph.Graph, []runtime.Object, error) {
 		return g, objs, err
 	}
 
-	mapper := latest.RESTMapper
+	mapper := registered.RESTMapper()
 	typer := kapi.Scheme
 	clientMapper := resource.ClientMapperFunc(func(mapping *meta.RESTMapping) (resource.RESTClient, error) {
 		return nil, nil
 	})
 
-	r := resource.NewBuilder(mapper, typer, clientMapper).
-		FilenameParam(false, abspath).
+	r := resource.NewBuilder(mapper, typer, clientMapper, kapi.Codecs.UniversalDecoder()).
+		FilenameParam(false, &resource.FilenameOptions{Recursive: false, Filenames: []string{abspath}}).
 		Flatten().
 		Do()
 

@@ -2,316 +2,371 @@ package builder
 
 import (
 	"bytes"
-	"log"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
-	dockercmd "github.com/docker/docker/builder/command"
-	"github.com/docker/docker/builder/parser"
+	"github.com/docker/docker/builder/dockerfile/parser"
+	"github.com/fsouza/go-dockerclient"
+	kapi "k8s.io/kubernetes/pkg/api"
+
+	"github.com/openshift/source-to-image/pkg/tar"
+	s2iutil "github.com/openshift/source-to-image/pkg/util"
+
+	"github.com/openshift/origin/pkg/build/api"
+	"github.com/openshift/origin/pkg/generate/git"
+	"github.com/openshift/origin/pkg/util/docker/dockerfile"
+	"github.com/openshift/origin/test/util"
 )
 
-func TestReplaceValidCmd(t *testing.T) {
+func TestInsertEnvAfterFrom(t *testing.T) {
+	tests := map[string]struct {
+		original string
+		env      []kapi.EnvVar
+		want     string
+	}{
+		"no FROM instruction": {
+			original: `RUN echo "invalid Dockerfile"
+`,
+			env: []kapi.EnvVar{
+				{Name: "PATH", Value: "/bin"},
+			},
+			want: `RUN echo "invalid Dockerfile"
+`},
+		"empty env": {
+			original: `FROM busybox
+`,
+			env: []kapi.EnvVar{},
+			want: `FROM busybox
+`},
+		"single FROM instruction": {
+			original: `FROM busybox
+RUN echo "hello world"
+`,
+			env: []kapi.EnvVar{
+				{Name: "PATH", Value: "/bin"},
+			},
+			want: `FROM busybox
+ENV "PATH"="/bin"
+RUN echo "hello world"
+`},
+		"multiple FROM instructions": {
+			original: `FROM scratch
+FROM busybox
+RUN echo "hello world"
+`,
+			env: []kapi.EnvVar{
+				{Name: "PATH", Value: "/bin"},
+				{Name: "GOPATH", Value: "/go"},
+				{Name: "PATH", Value: "/go/bin:$PATH"},
+			},
+			want: `FROM scratch
+ENV "PATH"="/bin" "GOPATH"="/go" "PATH"="/go/bin:$PATH"
+FROM busybox
+ENV "PATH"="/bin" "GOPATH"="/go" "PATH"="/go/bin:$PATH"
+RUN echo "hello world"`},
+	}
+	for name, test := range tests {
+		got, err := parser.Parse(strings.NewReader(test.original))
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		want, err := parser.Parse(strings.NewReader(test.want))
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		insertEnvAfterFrom(got, test.env)
+		if !bytes.Equal(dockerfile.ParseTreeToDockerfile(got), dockerfile.ParseTreeToDockerfile(want)) {
+			t.Errorf("%s: insertEnvAfterFrom(node, %+v) = %+v; want %+v", name, test.env, got, want)
+			t.Logf("resulting Dockerfile:\n%s", dockerfile.ParseTreeToDockerfile(got))
+		}
+	}
+}
+
+func TestReplaceLastFrom(t *testing.T) {
 	tests := []struct {
-		name           string
-		cmd            string
-		replaceArgs    string
-		fileData       []byte
-		expectedOutput string
-		expectedDiffs  int
-		expectedErr    error
+		original string
+		image    string
+		want     string
 	}{
 		{
-			name:           "from-replacement",
-			cmd:            dockercmd.From,
-			replaceArgs:    "other/image",
-			fileData:       []byte(dockerFile),
-			expectedOutput: expectedFROM,
-			expectedDiffs:  1,
-			expectedErr:    nil,
+			original: `# no FROM instruction`,
+			image:    "centos",
+			want:     ``,
 		},
 		{
-			name:           "run-replacement",
-			cmd:            dockercmd.Run,
-			replaceArgs:    "This test kind-of-fails before string replacement so this string won't be used",
-			fileData:       []byte(dockerFile),
-			expectedOutput: "",
-			expectedErr:    replaceCmdErr,
+			original: `FROM scratch
+# FROM busybox
+RUN echo "hello world"
+`,
+			image: "centos",
+			want: `FROM centos
+RUN echo "hello world"
+`,
 		},
 		{
-			name:           "invalid-dockerfile-cmd",
-			cmd:            "blabla",
-			replaceArgs:    "This test fails at start so this string won't be used",
-			fileData:       []byte(dockerFile),
-			expectedOutput: "",
-			expectedErr:    invalidCmdErr,
-		},
-		{
-			name:           "no-cmd-in-dockerfile",
-			cmd:            dockercmd.Cmd,
-			replaceArgs:    "runme.sh",
-			fileData:       []byte(dockerFile),
-			expectedOutput: "",
-			expectedErr:    replaceCmdErr,
-		},
-		{
-			name:           "trailing-slash",
-			cmd:            dockercmd.From,
-			replaceArgs:    "rhel",
-			fileData:       []byte(trSlashFile),
-			expectedOutput: expectedtrSlashFile,
-			expectedDiffs:  1,
-			expectedErr:    nil,
-		},
-		{
-			name:           "multiple trailing slashes plus plus",
-			cmd:            dockercmd.From,
-			replaceArgs:    "scratch",
-			fileData:       []byte(trickierFile),
-			expectedOutput: expectedTrickierFile,
-			expectedDiffs:  1,
-			expectedErr:    nil,
+			original: `FROM scratch
+FROM busybox
+RUN echo "hello world"
+`,
+			image: "centos",
+			want: `FROM scratch
+FROM centos
+RUN echo "hello world"
+`,
 		},
 	}
-
-	for _, test := range tests {
-		out, err := replaceValidCmd(test.cmd, test.replaceArgs, test.fileData)
-		if err != test.expectedErr {
-			t.Errorf("%s: Unexpected error: Expected %v, got %v", test.name, test.expectedErr, err)
-		}
-		if out != test.expectedOutput {
-			t.Errorf("%s: Unexpected output:\n\nExpected:\n%s\n(length: %d)\n\ngot:\n%s\n(length: %d)",
-				test.name, test.expectedOutput, len(test.expectedOutput), out, len(out))
-		}
-	}
-
-	// Re-use the tests above
-	var buf *bytes.Buffer
-	for _, test := range tests {
-		buf = bytes.NewBuffer([]byte(test.fileData))
-		original, err := parser.Parse(buf)
+	for i, test := range tests {
+		got, err := parser.Parse(strings.NewReader(test.original))
 		if err != nil {
-			log.Println(err)
+			t.Errorf("test[%d]: %v", i, err)
+			continue
 		}
-		repl, err := replaceValidCmd(test.cmd, test.replaceArgs, test.fileData)
+		want, err := parser.Parse(strings.NewReader(test.want))
 		if err != nil {
-			log.Println(err)
+			t.Errorf("test[%d]: %v", i, err)
+			continue
 		}
-		buf = bytes.NewBuffer([]byte(repl))
-		edited, err := parser.Parse(buf)
-		if err != nil {
-			log.Println(err)
-		}
-
-		diff := cmpASTs(original, edited)
-
-		if diff != test.expectedDiffs {
-			t.Errorf("%s: Edit mismatch, expected %d edit(s), got %d", test.name, test.expectedDiffs, diff)
+		replaceLastFrom(got, test.image)
+		if !bytes.Equal(dockerfile.ParseTreeToDockerfile(got), dockerfile.ParseTreeToDockerfile(want)) {
+			t.Errorf("test[%d]: replaceLastFrom(node, %+v) = %+v; want %+v", i, test.image, got, want)
+			t.Logf("resulting Dockerfile:\n%s", dockerfile.ParseTreeToDockerfile(got))
 		}
 	}
 }
 
-// cmpASTs compares two Abstract Syntax Trees and returns the
-// amount of differences between them
-func cmpASTs(original *parser.Node, edited *parser.Node) int {
-	index := 0
-	if original.Value != edited.Value {
-		index++
-	}
-
-	originalChildren := make([]*parser.Node, 0)
-	for _, n := range original.Children {
-		originalChildren = append(originalChildren, n)
-	}
-	editedChildren := make([]*parser.Node, 0)
-	for _, n := range edited.Children {
-		editedChildren = append(editedChildren, n)
-	}
-	for i := 0; i < len(editedChildren); i++ {
-		index += cmpASTs(originalChildren[i], editedChildren[i])
-	}
-
-	if original.Next != nil && edited.Next != nil {
-		index += cmpASTs(original.Next, edited.Next)
-	} else if original.Next != edited.Next {
-		index++
-	}
-	return index
-}
-
-func TestTraverseAST(t *testing.T) {
+// TestDockerfilePath validates that we can use a Dockerfile with a custom name, and in a sub-directory
+func TestDockerfilePath(t *testing.T) {
 	tests := []struct {
-		name     string
-		cmd      string
-		fileData []byte
-		expected int
+		contextDir     string
+		dockerfilePath string
+		dockerStrategy *api.DockerBuildStrategy
 	}{
+		// default Dockerfile path
 		{
-			name:     "dockerFile",
-			cmd:      dockercmd.Entrypoint,
-			fileData: []byte(dockerFile),
-			expected: 1,
+			dockerfilePath: "Dockerfile",
+			dockerStrategy: &api.DockerBuildStrategy{},
 		},
+		// custom Dockerfile path in the root context
 		{
-			name:     "dockerFile no newline",
-			cmd:      dockercmd.Entrypoint,
-			fileData: []byte(dockerFileNoNewline),
-			expected: 1,
+			dockerfilePath: "mydockerfile",
+			dockerStrategy: &api.DockerBuildStrategy{
+				DockerfilePath: "mydockerfile",
+			},
 		},
+		// custom Dockerfile path in a sub directory
 		{
-			name:     "expectedFROM",
-			cmd:      dockercmd.From,
-			fileData: []byte(expectedFROM),
-			expected: 2,
+			dockerfilePath: "dockerfiles/mydockerfile",
+			dockerStrategy: &api.DockerBuildStrategy{
+				DockerfilePath: "dockerfiles/mydockerfile",
+			},
 		},
+		// custom Dockerfile path in a sub directory
+		// with a contextDir
 		{
-			name:     "trSlashFile",
-			cmd:      dockercmd.Entrypoint,
-			fileData: []byte(trSlashFile),
-			expected: 0,
-		},
-		{
-			name:     "expectedtrSlashFile",
-			cmd:      dockercmd.Cmd,
-			fileData: []byte(expectedtrSlashFile),
-			expected: 1,
+			contextDir:     "somedir",
+			dockerfilePath: "dockerfiles/mydockerfile",
+			dockerStrategy: &api.DockerBuildStrategy{
+				DockerfilePath: "dockerfiles/mydockerfile",
+			},
 		},
 	}
 
-	var buf *bytes.Buffer
+	from := "FROM openshift/origin-base"
+	expected := []string{
+		from,
+		// expected env variables
+		"\"OPENSHIFT_BUILD_NAME\"=\"name\"",
+		"\"OPENSHIFT_BUILD_NAMESPACE\"=\"namespace\"",
+		"\"OPENSHIFT_BUILD_SOURCE\"=\"http://github.com/openshift/origin.git\"",
+		"\"OPENSHIFT_BUILD_COMMIT\"=\"commitid\"",
+		// expected labels
+		"\"io.openshift.build.commit.author\"=\"test user \\u003ctest@email.com\\u003e\"",
+		"\"io.openshift.build.commit.date\"=\"date\"",
+		"\"io.openshift.build.commit.id\"=\"commitid\"",
+		"\"io.openshift.build.commit.ref\"=\"ref\"",
+		"\"io.openshift.build.commit.message\"=\"message\"",
+	}
+
 	for _, test := range tests {
-		buf = bytes.NewBuffer([]byte(test.fileData))
-		node, err := parser.Parse(buf)
+		buildDir, err := ioutil.TempDir(util.GetBaseDir(), "dockerfile-path")
 		if err != nil {
-			log.Println(err)
+			t.Errorf("failed to create tmpdir: %v", err)
+			continue
+		}
+		absoluteDockerfilePath := filepath.Join(buildDir, test.contextDir, test.dockerfilePath)
+		if err = os.MkdirAll(filepath.Dir(absoluteDockerfilePath), os.FileMode(0750)); err != nil {
+			t.Errorf("failed to create directory %s: %v", filepath.Dir(absoluteDockerfilePath), err)
+			continue
+		}
+		if err = ioutil.WriteFile(absoluteDockerfilePath, []byte(from), os.FileMode(0644)); err != nil {
+			t.Errorf("failed to write dockerfile to %s: %v", absoluteDockerfilePath, err)
+			continue
 		}
 
-		howMany := traverseAST(test.cmd, node)
-		if howMany != test.expected {
-			t.Errorf("Wrong result, expected %d, got %d", test.expected, howMany)
+		build := &api.Build{
+			Spec: api.BuildSpec{
+				CommonSpec: api.CommonSpec{
+					Source: api.BuildSource{
+						Git: &api.GitBuildSource{
+							URI: "http://github.com/openshift/origin.git",
+						},
+						ContextDir: test.contextDir,
+					},
+					Strategy: api.BuildStrategy{
+						DockerStrategy: test.dockerStrategy,
+					},
+					Output: api.BuildOutput{
+						To: &kapi.ObjectReference{
+							Kind: "DockerImage",
+							Name: "test/test-result:latest",
+						},
+					},
+				},
+			},
 		}
+		build.Name = "name"
+		build.Namespace = "namespace"
+
+		sourceInfo := &git.SourceInfo{}
+		sourceInfo.AuthorName = "test user"
+		sourceInfo.AuthorEmail = "test@email.com"
+		sourceInfo.Date = "date"
+		sourceInfo.CommitID = "commitid"
+		sourceInfo.Ref = "ref"
+		sourceInfo.Message = "message"
+		dockerClient := &FakeDocker{
+			buildImageFunc: func(opts docker.BuildImageOptions) error {
+				if opts.Dockerfile != test.dockerfilePath {
+					t.Errorf("Unexpected dockerfile path: %s (expected: %s)", opts.Dockerfile, test.dockerfilePath)
+				}
+				return nil
+			},
+		}
+
+		dockerBuilder := &DockerBuilder{
+			dockerClient: dockerClient,
+			build:        build,
+			gitClient:    git.NewRepository(),
+			tar:          tar.New(s2iutil.NewFileSystem()),
+		}
+
+		// this will validate that the Dockerfile is readable
+		// and append some labels to the Dockerfile
+		if err = dockerBuilder.addBuildParameters(buildDir, sourceInfo); err != nil {
+			t.Errorf("failed to add build parameters: %v", err)
+			continue
+		}
+
+		// check that our Dockerfile has been modified
+		dockerfileData, err := ioutil.ReadFile(absoluteDockerfilePath)
+		if err != nil {
+			t.Errorf("failed to read dockerfile %s: %v", absoluteDockerfilePath, err)
+			continue
+		}
+		for _, value := range expected {
+			if !strings.Contains(string(dockerfileData), value) {
+				t.Errorf("Updated Dockerfile content does not contain expected value:\n%s\n\nUpdated content:\n%s\n", value, string(dockerfileData))
+
+			}
+		}
+
+		// check that the docker client is called with the right Dockerfile parameter
+		if err = dockerBuilder.dockerBuild(buildDir, "", []api.SecretBuildSource{}); err != nil {
+			t.Errorf("failed to build: %v", err)
+			continue
+		}
+		os.RemoveAll(buildDir)
 	}
 }
 
-func TestAppendEnvVars(t *testing.T) {
-	tests := []struct {
-		name       string
-		dockerFile string
-		envVars    map[string]string
-		expected   string
+func TestEmptySource(t *testing.T) {
+	build := &api.Build{
+		Spec: api.BuildSpec{
+			CommonSpec: api.CommonSpec{
+				Source: api.BuildSource{},
+				Strategy: api.BuildStrategy{
+					DockerStrategy: &api.DockerBuildStrategy{},
+				},
+				Output: api.BuildOutput{
+					To: &kapi.ObjectReference{
+						Kind: "DockerImage",
+						Name: "test/test-result:latest",
+					},
+				},
+			},
+		},
+	}
+
+	dockerBuilder := &DockerBuilder{
+		build: build,
+	}
+
+	if err := dockerBuilder.Build(); err == nil {
+		t.Error("Should have received error on docker build")
+	} else {
+		if !strings.Contains(err.Error(), "must provide a value for at least one of source, binary, images, or dockerfile") {
+			t.Errorf("Did not receive correct error: %v", err)
+		}
+	}
+}
+func TestGetDockerfileFrom(t *testing.T) {
+	tests := map[string]struct {
+		dockerfileContent string
+		want              []string
 	}{
-		{
-			name:       "regular dockerFile",
-			dockerFile: dockerFile,
-			envVars:    map[string]string{"VAR1": "value1"},
-			expected:   dockerFile + "ENV VAR1=\"value1\"\n",
+		"no FROM instruction": {
+			dockerfileContent: `RUN echo "invalid Dockerfile"
+`,
+			want: []string{},
 		},
-		{
-			name:       "dockerFile with no newline",
-			dockerFile: dockerFileNoNewline,
-			envVars:    map[string]string{"VAR1": "value1"},
-			expected:   dockerFileNoNewline + "\nENV VAR1=\"value1\"\n",
+		"single FROM instruction": {
+			dockerfileContent: `FROM scratch
+RUN echo "hello world"
+`,
+			want: []string{"scratch"},
+		},
+		"multi FROM instruction": {
+			dockerfileContent: `FROM scratch
+FROM busybox
+RUN echo "hello world"
+`,
+			want: []string{"scratch", "busybox"},
 		},
 	}
-
-	for _, test := range tests {
-		result := appendMetadata(Env, test.dockerFile, test.envVars)
-		if result != test.expected {
-			t.Errorf("%s: unexpected result.\n\tExpected: %s\n\tGot: %s\n", test.name, test.expected, result)
+	for i, test := range tests {
+		buildDir, err := ioutil.TempDir(util.GetBaseDir(), "dockerfile-path")
+		if err != nil {
+			t.Errorf("failed to create tmpdir: %v", err)
+			continue
 		}
+		dockerfilePath := filepath.Join(buildDir, defaultDockerfilePath)
+		dockerfileContent := test.dockerfileContent
+		if err = os.MkdirAll(filepath.Dir(dockerfilePath), os.FileMode(0750)); err != nil {
+			t.Errorf("failed to create directory %s: %v", filepath.Dir(dockerfilePath), err)
+			continue
+		}
+		if err = ioutil.WriteFile(dockerfilePath, []byte(dockerfileContent), os.FileMode(0644)); err != nil {
+			t.Errorf("failed to write dockerfile to %s: %v", dockerfilePath, err)
+			continue
+		}
+		froms := getDockerfileFrom(dockerfilePath)
+		if len(froms) != len(test.want) {
+			t.Errorf("test[%s]: getDockerfileFrom(dockerfilepath, %s) = %+v; want %+v", i, dockerfilePath, froms, test.want)
+			t.Logf("Dockerfile froms::\n%v", froms)
+			continue
+		}
+		for fi := range froms {
+			if froms[fi] != test.want[fi] {
+				t.Errorf("test[%s]: getDockerfileFrom(dockerfilepath, %s) = %+v; want %+v", i, dockerfilePath, froms, test.want)
+				t.Logf("Dockerfile froms::\n%v", froms)
+				break
+			}
+		}
+		os.RemoveAll(buildDir)
 	}
 }
-
-func TestAppendLabels(t *testing.T) {
-	tests := []struct {
-		name       string
-		dockerFile string
-		labels     map[string]string
-		expected   string
-	}{
-		{
-			name:       "regular dockerFile",
-			dockerFile: dockerFile,
-			labels:     map[string]string{"LABEL1": "value1"},
-			expected:   dockerFile + "LABEL LABEL1=\"value1\"\n",
-		},
-		{
-			name:       "dockerFile with no newline",
-			dockerFile: dockerFileNoNewline,
-			labels:     map[string]string{"LABEL1": "value1"},
-			expected:   dockerFileNoNewline + "\nLABEL LABEL1=\"value1\"\n",
-		},
-	}
-
-	for _, test := range tests {
-		result := appendMetadata(Label, test.dockerFile, test.labels)
-		if result != test.expected {
-			t.Errorf("%s: unexpected result.\n\tExpected: %s\n\tGot: %s\n", test.name, test.expected, result)
-		}
-	}
-}
-
-const (
-	dockerFile = `
-FROM openshift/origin-base
-FROM candidate
-
-RUN mkdir -p /var/lib/openshift
-
-ADD bin/openshift        /usr/bin/openshift
-RUN ln -s /usr/bin/openshift /usr/bin/oc && \
-
-ENV HOME /root
-WORKDIR /var/lib/openshift
-ENTRYPOINT ["/usr/bin/openshift"]
-`
-	dockerFileNoNewline = `
-FROM openshift/origin-base
-FROM candidate
-
-RUN mkdir -p /var/lib/openshift
-
-ADD bin/openshift        /usr/bin/openshift
-RUN ln -s /usr/bin/openshift /usr/bin/oc && \
-
-ENV HOME /root
-WORKDIR /var/lib/openshift
-ENTRYPOINT ["/usr/bin/openshift"]`
-
-	expectedFROM = `
-FROM openshift/origin-base
-FROM other/image
-
-RUN mkdir -p /var/lib/openshift
-
-ADD bin/openshift        /usr/bin/openshift
-RUN ln -s /usr/bin/openshift /usr/bin/oc && \
-
-ENV HOME /root
-WORKDIR /var/lib/openshift
-ENTRYPOINT ["/usr/bin/openshift"]
-`
-
-	trSlashFile = `
-from \
-centos
-CMD "cat /etc/passwd"`
-
-	expectedtrSlashFile = `
-from \
-rhel
-CMD "cat /etc/passwd"`
-
-	trickierFile = `
-from centos \
-rhel \
-ubuntu
-
-CMD ["executable","param1","param2"]
-`
-
-	expectedTrickierFile = `
-from \
-scratch
-
-CMD ["executable","param1","param2"]
-`
-)

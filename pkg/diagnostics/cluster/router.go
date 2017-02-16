@@ -11,19 +11,18 @@ import (
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	kerrs "k8s.io/kubernetes/pkg/api/errors"
-	kclient "k8s.io/kubernetes/pkg/client"
-	"k8s.io/kubernetes/pkg/fields"
+	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/labels"
 
 	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
 	osclient "github.com/openshift/origin/pkg/client"
-	osapi "github.com/openshift/origin/pkg/deploy/api"
+	deployapi "github.com/openshift/origin/pkg/deploy/api"
 	"github.com/openshift/origin/pkg/diagnostics/types"
 )
 
 // ClusterRouter is a Diagnostic to check that there is a working router.
 type ClusterRouter struct {
-	KubeClient *kclient.Client
+	KubeClient kclientset.Interface
 	OsClient   *osclient.Client
 }
 
@@ -95,16 +94,17 @@ func (d *ClusterRouter) CanRun() (bool, error) {
 	if d.KubeClient == nil || d.OsClient == nil {
 		return false, errors.New("must have kube and os client")
 	}
-	can, err := adminCan(d.OsClient, authorizationapi.AuthorizationAttributes{
+	can, err := userCan(d.OsClient, authorizationapi.Action{
 		Namespace:    kapi.NamespaceDefault,
 		Verb:         "get",
-		Resource:     "dc",
+		Group:        deployapi.GroupName,
+		Resource:     "deploymentconfigs",
 		ResourceName: routerName,
 	})
 	if err != nil {
-		return false, types.DiagnosticError{"DClu2010", fmt.Sprintf(clientAccessError, err), err}
+		return false, types.DiagnosticError{ID: "DClu2010", LogMessage: fmt.Sprintf(clientAccessError, err), Cause: err}
 	} else if !can {
-		return false, types.DiagnosticError{"DClu2011", "Client does not have cluster-admin access", err}
+		return false, types.DiagnosticError{ID: "DClu2011", LogMessage: "Client does not have cluster-admin access", Cause: err}
 	}
 	return true, nil
 }
@@ -123,7 +123,7 @@ func (d *ClusterRouter) Check() types.DiagnosticResult {
 	return r
 }
 
-func (d *ClusterRouter) getRouterDC(r types.DiagnosticResult) *osapi.DeploymentConfig {
+func (d *ClusterRouter) getRouterDC(r types.DiagnosticResult) *deployapi.DeploymentConfig {
 	dc, err := d.OsClient.DeploymentConfigs(kapi.NamespaceDefault).Get(routerName)
 	if err != nil && reflect.TypeOf(err) == reflect.TypeOf(&kerrs.StatusError{}) {
 		r.Warn("DClu2001", err, fmt.Sprintf(clGetRtNone, routerName))
@@ -136,8 +136,8 @@ func (d *ClusterRouter) getRouterDC(r types.DiagnosticResult) *osapi.DeploymentC
 	return dc
 }
 
-func (d *ClusterRouter) getRouterPods(dc *osapi.DeploymentConfig, r types.DiagnosticResult) *kapi.PodList {
-	pods, err := d.KubeClient.Pods(kapi.NamespaceDefault).List(labels.SelectorFromSet(dc.Template.ControllerTemplate.Selector), fields.Everything())
+func (d *ClusterRouter) getRouterPods(dc *deployapi.DeploymentConfig, r types.DiagnosticResult) *kapi.PodList {
+	pods, err := d.KubeClient.Core().Pods(kapi.NamespaceDefault).List(kapi.ListOptions{LabelSelector: labels.SelectorFromSet(dc.Spec.Selector)})
 	if err != nil {
 		r.Error("DClu2004", err, fmt.Sprintf("Finding pods for '%s' DeploymentConfig failed. This should never happen. Error: (%[2]T) %[2]v", routerName, err))
 		return nil
@@ -170,7 +170,7 @@ func (s *lineScanner) Text() string { return s.Scanner.Text() }
 func (s *lineScanner) Close() error { return s.ReadCloser.Close() }
 
 func (d *ClusterRouter) getPodLogScanner(pod *kapi.Pod) (*lineScanner, error) {
-	readCloser, err := d.KubeClient.RESTClient.Get().
+	readCloser, err := d.KubeClient.Core().RESTClient().Get().
 		Namespace(pod.ObjectMeta.Namespace).
 		Name(pod.ObjectMeta.Name).
 		Resource("pods").SubResource("log").

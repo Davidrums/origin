@@ -7,9 +7,7 @@ import (
 
 	imageapi "github.com/openshift/origin/pkg/image/api"
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	kubeutil "k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/intstr"
 )
 
 type ValidateFunc func(string) error
@@ -42,7 +40,7 @@ func WaitForAddress(pod *kapi.Pod, service *kapi.Service, ns string) (string, er
 	if err != nil {
 		return "", err
 	}
-	watcher, err := client.Endpoints(ns).Watch(labels.Everything(), fields.Everything(), "0")
+	watcher, err := client.Core().Endpoints(ns).Watch(kapi.ListOptions{})
 	if err != nil {
 		return "", fmt.Errorf("Unexpected error: %v", err)
 	}
@@ -62,7 +60,7 @@ func WaitForAddress(pod *kapi.Pod, service *kapi.Service, ns string) (string, er
 		for _, s := range eventEndpoint.Subsets {
 			for _, p := range s.Ports {
 				for _, a := range s.Addresses {
-					addr := net.JoinHostPort(a.IP, strconv.Itoa(p.Port))
+					addr := net.JoinHostPort(a.IP, strconv.Itoa(int(p.Port)))
 					fmt.Printf("Discovered new %s endpoint: %s\n", service.Name, addr)
 					return addr, nil
 				}
@@ -98,7 +96,7 @@ func CreatePodFromImage(stream *imageapi.ImageStream, tag, ns string) *kapi.Pod 
 			RestartPolicy: kapi.RestartPolicyNever,
 		},
 	}
-	if pod, err := client.Pods(ns).Create(pod); err != nil {
+	if pod, err := client.Core().Pods(ns).Create(pod); err != nil {
 		fmt.Printf("%v\n", err)
 		return nil
 	} else {
@@ -120,11 +118,11 @@ func CreateServiceForPod(pod *kapi.Pod, ns string) *kapi.Service {
 			Selector: map[string]string{"name": ns},
 			Ports: []kapi.ServicePort{{
 				Port:       8080,
-				TargetPort: kubeutil.IntOrString{Kind: kubeutil.IntstrInt, IntVal: 8080},
+				TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: 8080},
 			}},
 		},
 	}
-	if service, err := client.Services(ns).Create(service); err != nil {
+	if service, err := client.Core().Services(ns).Create(service); err != nil {
 		fmt.Printf("%v\n", err)
 		return nil
 	} else {
@@ -138,6 +136,6 @@ func CleanupServiceAndPod(pod *kapi.Pod, service *kapi.Service, ns string) {
 	if err != nil {
 		return
 	}
-	client.Pods(ns).Delete(pod.Name, nil)
-	client.Services(ns).Delete(service.Name)
+	client.Core().Pods(ns).Delete(pod.Name, nil)
+	client.Core().Services(ns).Delete(service.Name, nil)
 }

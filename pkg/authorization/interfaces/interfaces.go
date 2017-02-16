@@ -2,7 +2,8 @@ package interfaces
 
 import (
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/auth/user"
+	"k8s.io/kubernetes/pkg/util/sets"
 
 	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
 )
@@ -34,8 +35,11 @@ type RoleBinding interface {
 	Namespace() string
 
 	RoleRef() kapi.ObjectReference
-	Users() util.StringSet
-	Groups() util.StringSet
+	Users() sets.String
+	Groups() sets.String
+
+	// AppliesToUser returns true if the provided user matches this role binding
+	AppliesToUser(user.Info) bool
 }
 
 func NewClusterPolicyAdapter(policy *authorizationapi.ClusterPolicy) Policy {
@@ -207,16 +211,27 @@ func (a RoleBindingAdapter) RoleRef() kapi.ObjectReference {
 	return a.roleBinding.RoleRef
 }
 
-func (a RoleBindingAdapter) Users() util.StringSet {
+func (a RoleBindingAdapter) Users() sets.String {
 	users, _ := authorizationapi.StringSubjectsFor(a.roleBinding.Namespace, a.roleBinding.Subjects)
 
-	return util.NewStringSet(users...)
+	return sets.NewString(users...)
 }
 
-func (a RoleBindingAdapter) Groups() util.StringSet {
+func (a RoleBindingAdapter) Groups() sets.String {
 	_, groups := authorizationapi.StringSubjectsFor(a.roleBinding.Namespace, a.roleBinding.Subjects)
 
-	return util.NewStringSet(groups...)
+	return sets.NewString(groups...)
+}
+
+// AppliesToUser returns true if this binding applies to the provided user.
+func (a RoleBindingAdapter) AppliesToUser(user user.Info) bool {
+	if authorizationapi.SubjectsContainUser(a.roleBinding.Subjects, a.roleBinding.Namespace, user.GetName()) {
+		return true
+	}
+	if authorizationapi.SubjectsContainAnyGroup(a.roleBinding.Subjects, user.GetGroups()) {
+		return true
+	}
+	return false
 }
 
 type ClusterPolicyBindingAdapter struct {
@@ -264,13 +279,24 @@ func (a ClusterRoleBindingAdapter) RoleRef() kapi.ObjectReference {
 	return a.roleBinding.RoleRef
 }
 
-func (a ClusterRoleBindingAdapter) Users() util.StringSet {
+func (a ClusterRoleBindingAdapter) Users() sets.String {
 	users, _ := authorizationapi.StringSubjectsFor(a.roleBinding.Namespace, a.roleBinding.Subjects)
 
-	return util.NewStringSet(users...)
+	return sets.NewString(users...)
 }
-func (a ClusterRoleBindingAdapter) Groups() util.StringSet {
+func (a ClusterRoleBindingAdapter) Groups() sets.String {
 	_, groups := authorizationapi.StringSubjectsFor(a.roleBinding.Namespace, a.roleBinding.Subjects)
 
-	return util.NewStringSet(groups...)
+	return sets.NewString(groups...)
+}
+
+// AppliesToUser returns true if this binding applies to the provided user.
+func (a ClusterRoleBindingAdapter) AppliesToUser(user user.Info) bool {
+	if authorizationapi.SubjectsContainUser(a.roleBinding.Subjects, a.roleBinding.Namespace, user.GetName()) {
+		return true
+	}
+	if authorizationapi.SubjectsContainAnyGroup(a.roleBinding.Subjects, user.GetGroups()) {
+		return true
+	}
+	return false
 }

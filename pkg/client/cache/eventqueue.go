@@ -5,7 +5,7 @@ import (
 	"sync"
 
 	kcache "k8s.io/kubernetes/pkg/client/cache"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/watch"
 )
 
@@ -42,7 +42,21 @@ type EventQueue struct {
 	keyFn  kcache.KeyFunc
 	events map[string]watch.EventType
 	queue  []string
+	// Tracks the last key added to the queue by the most recent call
+	// to Replace().  A reflector replaces the queue contents on a
+	// re-list by calling Replace() and the compression algorithm does
+	// not apply to those items, so a non-empty key is valid until the
+	// item it refers to is explicitly deleted from the store or the
+	// event is read via Pop().
+	lastReplaceKey string
+	// Tracks whether the Replace() method has been called at least once.
+	replaceCalled bool
+	// Tracks the number of items queued by the last Replace() call.
+	replaceCount int
 }
+
+// EventQueue implements kcache.Store
+var _ kcache.Store = &EventQueue{}
 
 // Describes the effect of processing a watch event on the event queue's state.
 type watchEventEffect string
@@ -222,14 +236,14 @@ func (eq *EventQueue) ListKeys() []string {
 	return list
 }
 
-// ContainedIDs returns a util.StringSet containing all IDs of the enqueued items.
+// ContainedIDs returns a sets.String containing all IDs of the enqueued items.
 // This is a snapshot of a moment in time, and one should keep in mind that
 // other go routines can add or remove items after you call this.
-func (eq *EventQueue) ContainedIDs() util.StringSet {
+func (eq *EventQueue) ContainedIDs() sets.String {
 	eq.lock.RLock()
 	defer eq.lock.RUnlock()
 
-	s := util.StringSet{}
+	s := sets.String{}
 	for _, key := range eq.queue {
 		s.Insert(key)
 	}
@@ -279,6 +293,13 @@ func (eq *EventQueue) Pop() (watch.EventType, interface{}, error) {
 		eventType := eq.events[key]
 		delete(eq.events, key)
 
+		// Track the last replace key immediately after the store
+		// state has been changed to prevent subsequent errors from
+		// leaving a stale key.
+		if eq.lastReplaceKey != "" && eq.lastReplaceKey == key {
+			eq.lastReplaceKey = ""
+		}
+
 		obj, exists, err := eq.store.GetByKey(key) // Should always succeed
 		if err != nil {
 			return watch.Error, nil, err
@@ -301,9 +322,12 @@ func (eq *EventQueue) Pop() (watch.EventType, interface{}, error) {
 // populates the queue with a watch.Modified event for each of the replaced
 // objects.  The backing store takes ownership of keyToObjs; you should not
 // reference the map again after calling this function.
-func (eq *EventQueue) Replace(objects []interface{}) error {
+func (eq *EventQueue) Replace(objects []interface{}, resourceVersion string) error {
 	eq.lock.Lock()
 	defer eq.lock.Unlock()
+
+	eq.replaceCalled = true
+	eq.replaceCount = len(objects)
 
 	eq.events = map[string]watch.EventType{}
 	eq.queue = eq.queue[:0]
@@ -316,20 +340,85 @@ func (eq *EventQueue) Replace(objects []interface{}) error {
 		eq.queue = append(eq.queue, key)
 		eq.events[key] = watch.Modified
 	}
-	if err := eq.store.Replace(objects); err != nil {
+	if err := eq.store.Replace(objects, resourceVersion); err != nil {
 		return err
 	}
 
 	if len(eq.queue) > 0 {
+		eq.lastReplaceKey = eq.queue[len(eq.queue)-1]
 		eq.cond.Broadcast()
+	} else {
+		eq.lastReplaceKey = ""
 	}
 	return nil
 }
 
-// NewEventQueue returns a new EventQueue ready for action.
+// ListSuccessfulAtLeastOnce indicates whether a List operation was
+// successfully completed regardless of whether any items were queued.
+func (eq *EventQueue) ListSuccessfulAtLeastOnce() bool {
+	eq.lock.Lock()
+	defer eq.lock.Unlock()
+
+	return eq.replaceCalled
+}
+
+// ListCount returns how many objects were queued by the most recent List operation.
+func (eq *EventQueue) ListCount() int {
+	eq.lock.Lock()
+	defer eq.lock.Unlock()
+
+	return eq.replaceCount
+}
+
+// ListConsumed indicates whether the items queued by a List/Relist
+// operation have been consumed.
+func (eq *EventQueue) ListConsumed() bool {
+	eq.lock.Lock()
+	defer eq.lock.Unlock()
+
+	return eq.lastReplaceKey == ""
+}
+
+// Resync will touch all objects to put them into the processing queue
+func (eq *EventQueue) Resync() error {
+	eq.lock.Lock()
+	defer eq.lock.Unlock()
+
+	inQueue := sets.NewString()
+	for _, id := range eq.queue {
+		inQueue.Insert(id)
+	}
+
+	for _, id := range eq.store.ListKeys() {
+		if !inQueue.Has(id) {
+			eq.queue = append(eq.queue, id)
+		}
+	}
+
+	if len(eq.queue) > 0 {
+		eq.cond.Broadcast()
+	} else {
+		eq.lastReplaceKey = ""
+	}
+	return nil
+}
+
+// NewEventQueue returns a new EventQueue.
 func NewEventQueue(keyFn kcache.KeyFunc) *EventQueue {
 	q := &EventQueue{
 		store:  kcache.NewStore(keyFn),
+		events: map[string]watch.EventType{},
+		queue:  []string{},
+		keyFn:  keyFn,
+	}
+	q.cond.L = &q.lock
+	return q
+}
+
+// NewEventQueueForStore returns a new EventQueue that uses the provided store.
+func NewEventQueueForStore(keyFn kcache.KeyFunc, store kcache.Store) *EventQueue {
+	q := &EventQueue{
+		store:  store,
 		events: map[string]watch.EventType{},
 		queue:  []string{},
 		keyFn:  keyFn,

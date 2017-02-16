@@ -7,7 +7,8 @@ import (
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/client/testclient"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
+	"k8s.io/kubernetes/pkg/client/testing/core"
 	"k8s.io/kubernetes/pkg/runtime"
 
 	"github.com/openshift/origin/pkg/security"
@@ -17,20 +18,20 @@ import (
 )
 
 func TestController(t *testing.T) {
-	var action testclient.Action
-	client := &testclient.Fake{
-		ReactFn: func(a testclient.Action) (runtime.Object, error) {
-			action = a
-			return (*kapi.Namespace)(nil), nil
-		},
-	}
+	var action core.Action
+	client := &fake.Clientset{}
+	client.AddReactor("*", "*", func(a core.Action) (handled bool, ret runtime.Object, err error) {
+		action = a
+		return true, (*kapi.Namespace)(nil), nil
+	})
+
 	uidr, _ := uid.NewRange(10, 20, 2)
 	mcsr, _ := mcs.NewRange("s0:", 10, 2)
 	uida := uidallocator.NewInMemory(uidr)
 	c := Allocation{
 		uid:    uida,
 		mcs:    DefaultMCSAllocation(uidr, mcsr, 5),
-		client: client.Namespaces(),
+		client: client.Core().Namespaces(),
 	}
 
 	err := c.Next(&kapi.Namespace{ObjectMeta: kapi.ObjectMeta{Name: "test"}})
@@ -38,12 +39,15 @@ func TestController(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := action.(testclient.CreateAction).GetObject().(*kapi.Namespace)
+	got := action.(core.CreateAction).GetObject().(*kapi.Namespace)
 	if got.Annotations[security.UIDRangeAnnotation] != "10/2" {
-		t.Errorf("unexpected annotation: %#v", got)
+		t.Errorf("unexpected uid annotation: %#v", got)
+	}
+	if got.Annotations[security.SupplementalGroupsAnnotation] != "10/2" {
+		t.Errorf("unexpected supplemental group annotation: %#v", got)
 	}
 	if got.Annotations[security.MCSAnnotation] != "s0:c1,c0" {
-		t.Errorf("unexpected annotation: %#v", got)
+		t.Errorf("unexpected mcs annotation: %#v", got)
 	}
 	if !uida.Has(uid.Block{Start: 10, End: 11}) {
 		t.Errorf("did not allocate uid: %#v", uida)
@@ -54,11 +58,11 @@ func TestControllerError(t *testing.T) {
 	testCases := map[string]struct {
 		err     func() error
 		errFn   func(err error) bool
-		reactFn testclient.ReactionFunc
+		reactFn core.ReactionFunc
 		actions int
 	}{
 		"not found": {
-			err:     func() error { return errors.NewNotFound("namespace", "test") },
+			err:     func() error { return errors.NewNotFound(kapi.Resource("Namespace"), "test") },
 			errFn:   func(err error) bool { return err == nil },
 			actions: 1,
 		},
@@ -69,11 +73,11 @@ func TestControllerError(t *testing.T) {
 		},
 		"conflict": {
 			actions: 4,
-			reactFn: func(a testclient.Action) (runtime.Object, error) {
+			reactFn: func(a core.Action) (bool, runtime.Object, error) {
 				if a.Matches("get", "namespaces") {
-					return &kapi.Namespace{ObjectMeta: kapi.ObjectMeta{Name: "test"}}, nil
+					return true, &kapi.Namespace{ObjectMeta: kapi.ObjectMeta{Name: "test"}}, nil
 				}
-				return (*kapi.Namespace)(nil), errors.NewConflict("namespace", "test", fmt.Errorf("test conflict"))
+				return true, (*kapi.Namespace)(nil), errors.NewConflict(kapi.Resource("namespace"), "test", fmt.Errorf("test conflict"))
 			},
 			errFn: func(err error) bool {
 				return err != nil && strings.Contains(err.Error(), "unable to allocate security info")
@@ -82,19 +86,23 @@ func TestControllerError(t *testing.T) {
 	}
 
 	for s, testCase := range testCases {
-		client := &testclient.Fake{ReactFn: testCase.reactFn}
-		if client.ReactFn == nil {
-			client.ReactFn = func(a testclient.Action) (runtime.Object, error) {
-				return (*kapi.Namespace)(nil), testCase.err()
+		client := &fake.Clientset{}
+
+		if testCase.reactFn == nil {
+			testCase.reactFn = func(a core.Action) (bool, runtime.Object, error) {
+				return true, (*kapi.Namespace)(nil), testCase.err()
 			}
 		}
+
+		client.AddReactor("*", "*", testCase.reactFn)
+
 		uidr, _ := uid.NewRange(10, 19, 2)
 		mcsr, _ := mcs.NewRange("s0:", 10, 2)
 		uida := uidallocator.NewInMemory(uidr)
 		c := Allocation{
 			uid:    uida,
 			mcs:    DefaultMCSAllocation(uidr, mcsr, 5),
-			client: client.Namespaces(),
+			client: client.Core().Namespaces(),
 		}
 
 		err := c.Next(&kapi.Namespace{ObjectMeta: kapi.ObjectMeta{Name: "test"}})

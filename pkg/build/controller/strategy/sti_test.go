@@ -3,22 +3,18 @@ package strategy
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"k8s.io/kubernetes/pkg/admission"
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/resource"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/util/validation"
 
-	"github.com/openshift/origin/pkg/api/latest"
 	buildapi "github.com/openshift/origin/pkg/build/api"
-	buildutil "github.com/openshift/origin/pkg/build/util"
+	_ "github.com/openshift/origin/pkg/build/api/install"
 )
-
-type FakeTempDirCreator struct{}
-
-func (t *FakeTempDirCreator) CreateTempDirectory() (string, error) {
-	return "test_temp", nil
-}
 
 type FakeAdmissionControl struct {
 	admit bool
@@ -43,26 +39,31 @@ func TestSTICreateBuildPodRootAllowed(t *testing.T) {
 	testSTICreateBuildPod(t, true)
 }
 
+var nodeSelector = map[string]string{"node": "mynode"}
+
 func testSTICreateBuildPod(t *testing.T, rootAllowed bool) {
 	strategy := &SourceBuildStrategy{
-		Image:                "sti-test-image",
-		TempDirectoryCreator: &FakeTempDirCreator{},
-		Codec:                latest.Codec,
-		AdmissionControl:     &FakeAdmissionControl{admit: rootAllowed},
+		Image:            "sti-test-image",
+		Codec:            kapi.Codecs.LegacyCodec(buildapi.SchemeGroupVersion),
+		AdmissionControl: &FakeAdmissionControl{admit: rootAllowed},
 	}
 
-	expected := mockSTIBuild()
-	actual, err := strategy.CreateBuildPod(expected)
+	build := mockSTIBuild()
+	actual, err := strategy.CreateBuildPod(build)
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
-	if expected, actual := buildutil.GetBuildPodName(expected), actual.ObjectMeta.Name; expected != actual {
+	if expected, actual := buildapi.GetBuildPodName(build), actual.ObjectMeta.Name; expected != actual {
 		t.Errorf("Expected %s, but got %s!", expected, actual)
 	}
-	if !reflect.DeepEqual(map[string]string{buildapi.BuildLabel: expected.Name}, actual.Labels) {
+	if !reflect.DeepEqual(map[string]string{buildapi.BuildLabel: buildapi.LabelValue(build.Name)}, actual.Labels) {
 		t.Errorf("Pod Labels does not match Build Labels!")
 	}
+	if !reflect.DeepEqual(nodeSelector, actual.Spec.NodeSelector) {
+		t.Errorf("Pod NodeSelector does not match Build NodeSelector.  Expected: %v, got: %v", nodeSelector, actual.Spec.NodeSelector)
+	}
+
 	container := actual.Spec.Containers[0]
 	if container.Name != "sti-build" {
 		t.Errorf("Expected sti-build, but got %s!", container.Name)
@@ -76,14 +77,19 @@ func testSTICreateBuildPod(t *testing.T, rootAllowed bool) {
 	if actual.Spec.RestartPolicy != kapi.RestartPolicyNever {
 		t.Errorf("Expected never, got %#v", actual.Spec.RestartPolicy)
 	}
+
 	// strategy ENV is whitelisted into the container environment, and not all
-	// the values are allowed, so only expect 6 not 7 values.
-	expectedEnvCount := 8
+	// the values are allowed, so only expect 10 not 11 values.
+	expectedEnvCount := 10
 	if !rootAllowed {
-		expectedEnvCount = 9
+		expectedEnvCount = 12
 	}
 	if len(container.Env) != expectedEnvCount {
-		t.Fatalf("Expected 9 elements in Env table, got %d: %+v", len(container.Env), container.Env)
+		var keys []string
+		for _, env := range container.Env {
+			keys = append(keys, env.Name)
+		}
+		t.Fatalf("Expected 11 elements in Env table, got %d:\n%s", len(container.Env), strings.Join(keys, ", "))
 	}
 	if len(container.VolumeMounts) != 4 {
 		t.Fatalf("Expected 4 volumes in container, got %d", len(container.VolumeMounts))
@@ -96,12 +102,16 @@ func testSTICreateBuildPod(t *testing.T, rootAllowed bool) {
 	if len(actual.Spec.Volumes) != 4 {
 		t.Fatalf("Expected 4 volumes in Build pod, got %d", len(actual.Spec.Volumes))
 	}
-	if !kapi.Semantic.DeepEqual(container.Resources, expected.Spec.Resources) {
-		t.Fatalf("Expected actual=expected, %v != %v", container.Resources, expected.Spec.Resources)
+	if *actual.Spec.ActiveDeadlineSeconds != 60 {
+		t.Errorf("Expected ActiveDeadlineSeconds 60, got %d", *actual.Spec.ActiveDeadlineSeconds)
+	}
+	if !kapi.Semantic.DeepEqual(container.Resources, build.Spec.Resources) {
+		t.Fatalf("Expected actual=expected, %v != %v", container.Resources, build.Spec.Resources)
 	}
 	found := false
 	foundIllegal := false
 	foundAllowedUIDs := false
+	foundDropCaps := false
 	for _, v := range container.Env {
 		if v.Name == "BUILD_LOGLEVEL" && v.Value == "bar" {
 			found = true
@@ -109,8 +119,11 @@ func testSTICreateBuildPod(t *testing.T, rootAllowed bool) {
 		if v.Name == "ILLEGAL" {
 			foundIllegal = true
 		}
-		if v.Name == "ALLOWED_UIDS" && v.Value == "1-" {
+		if v.Name == buildapi.AllowedUIDs && v.Value == "1-" {
 			foundAllowedUIDs = true
+		}
+		if v.Name == buildapi.DropCapabilities && v.Value == "KILL,MKNOD,SETGID,SETUID,SYS_CHROOT" {
+			foundDropCaps = true
 		}
 	}
 	if !found {
@@ -120,12 +133,18 @@ func testSTICreateBuildPod(t *testing.T, rootAllowed bool) {
 		t.Fatalf("Found illegal environment variable 'ILLEGAL' defined on container")
 	}
 	if foundAllowedUIDs && rootAllowed {
-		t.Fatalf("Did not expect ALLOWED_UIDS when root is allowed")
+		t.Fatalf("Did not expect %s when root is allowed", buildapi.AllowedUIDs)
 	}
 	if !foundAllowedUIDs && !rootAllowed {
-		t.Fatalf("Expected ALLLOWED_UIDS when root is not allowed")
+		t.Fatalf("Expected %s when root is not allowed", buildapi.AllowedUIDs)
 	}
-	buildJSON, _ := latest.Codec.Encode(expected)
+	if foundDropCaps && rootAllowed {
+		t.Fatalf("Did not expect %s when root is allowed", buildapi.DropCapabilities)
+	}
+	if !foundDropCaps && !rootAllowed {
+		t.Fatalf("Expected %s when root is not allowed", buildapi.DropCapabilities)
+	}
+	buildJSON, _ := runtime.Encode(kapi.Codecs.LegacyCodec(buildapi.SchemeGroupVersion), build)
 	errorCases := map[int][]string{
 		0: {"BUILD", string(buildJSON)},
 	}
@@ -136,7 +155,25 @@ func testSTICreateBuildPod(t *testing.T, rootAllowed bool) {
 	}
 }
 
+func TestS2IBuildLongName(t *testing.T) {
+	strategy := &SourceBuildStrategy{
+		Image:            "sti-test-image",
+		Codec:            kapi.Codecs.LegacyCodec(buildapi.SchemeGroupVersion),
+		AdmissionControl: &FakeAdmissionControl{admit: true},
+	}
+	build := mockSTIBuild()
+	build.Name = strings.Repeat("a", validation.DNS1123LabelMaxLength*2)
+	pod, err := strategy.CreateBuildPod(build)
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if pod.Labels[buildapi.BuildLabel] != build.Name[:validation.DNS1123LabelMaxLength] {
+		t.Errorf("Unexpected build label value: %s", pod.Labels[buildapi.BuildLabel])
+	}
+}
+
 func mockSTIBuild() *buildapi.Build {
+	timeout := int64(60)
 	return &buildapi.Build{
 		ObjectMeta: kapi.ObjectMeta{
 			Name: "stiBuild",
@@ -145,44 +182,47 @@ func mockSTIBuild() *buildapi.Build {
 			},
 		},
 		Spec: buildapi.BuildSpec{
-			Revision: &buildapi.SourceRevision{
-				Git: &buildapi.GitSourceRevision{},
-			},
-			Source: buildapi.BuildSource{
-				Git: &buildapi.GitBuildSource{
-					URI: "http://my.build.com/the/stibuild/Dockerfile",
-					Ref: "master",
+			CommonSpec: buildapi.CommonSpec{
+				Revision: &buildapi.SourceRevision{
+					Git: &buildapi.GitSourceRevision{},
 				},
-				ContextDir:   "foo",
-				SourceSecret: &kapi.LocalObjectReference{Name: "fooSecret"},
-			},
-			Strategy: buildapi.BuildStrategy{
-				Type: buildapi.SourceBuildStrategyType,
-				SourceStrategy: &buildapi.SourceBuildStrategy{
-					From: kapi.ObjectReference{
+				Source: buildapi.BuildSource{
+					Git: &buildapi.GitBuildSource{
+						URI: "http://my.build.com/the/stibuild/Dockerfile",
+						Ref: "master",
+					},
+					ContextDir:   "foo",
+					SourceSecret: &kapi.LocalObjectReference{Name: "fooSecret"},
+				},
+				Strategy: buildapi.BuildStrategy{
+					SourceStrategy: &buildapi.SourceBuildStrategy{
+						From: kapi.ObjectReference{
+							Kind: "DockerImage",
+							Name: "repository/sti-builder",
+						},
+						PullSecret: &kapi.LocalObjectReference{Name: "bar"},
+						Scripts:    "http://my.build.com/the/sti/scripts",
+						Env: []kapi.EnvVar{
+							{Name: "BUILD_LOGLEVEL", Value: "bar"},
+							{Name: "ILLEGAL", Value: "foo"},
+						},
+					},
+				},
+				Output: buildapi.BuildOutput{
+					To: &kapi.ObjectReference{
 						Kind: "DockerImage",
-						Name: "repository/sti-builder",
+						Name: "docker-registry/repository/stiBuild",
 					},
-					PullSecret: &kapi.LocalObjectReference{Name: "bar"},
-					Scripts:    "http://my.build.com/the/sti/scripts",
-					Env: []kapi.EnvVar{
-						{Name: "BUILD_LOGLEVEL", Value: "bar"},
-						{Name: "ILLEGAL", Value: "foo"},
+					PushSecret: &kapi.LocalObjectReference{Name: "foo"},
+				},
+				Resources: kapi.ResourceRequirements{
+					Limits: kapi.ResourceList{
+						kapi.ResourceName(kapi.ResourceCPU):    resource.MustParse("10"),
+						kapi.ResourceName(kapi.ResourceMemory): resource.MustParse("10G"),
 					},
 				},
-			},
-			Output: buildapi.BuildOutput{
-				To: &kapi.ObjectReference{
-					Kind: "DockerImage",
-					Name: "docker-registry/repository/stiBuild",
-				},
-				PushSecret: &kapi.LocalObjectReference{Name: "foo"},
-			},
-			Resources: kapi.ResourceRequirements{
-				Limits: kapi.ResourceList{
-					kapi.ResourceName(kapi.ResourceCPU):    resource.MustParse("10"),
-					kapi.ResourceName(kapi.ResourceMemory): resource.MustParse("10G"),
-				},
+				CompletionDeadlineSeconds: &timeout,
+				NodeSelector:              nodeSelector,
 			},
 		},
 		Status: buildapi.BuildStatus{

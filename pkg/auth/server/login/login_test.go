@@ -12,6 +12,7 @@ import (
 	"k8s.io/kubernetes/pkg/auth/user"
 
 	"github.com/openshift/origin/pkg/auth/server/csrf"
+	"github.com/openshift/origin/pkg/auth/userregistry/identitymapper"
 )
 
 type testAuth struct {
@@ -52,12 +53,13 @@ func TestLogin(t *testing.T) {
 		"display form": {
 			CSRF: &csrf.FakeCSRF{Token: "test"},
 			Auth: &testAuth{},
-			Path: "/login",
+			Path: "/login?then=%2F",
 
 			ExpectStatusCode: 200,
 			ExpectContains: []string{
 				`action="/login"`,
 				`name="csrf" value="test"`,
+				`name="then" value="/"`,
 			},
 		},
 		"display form with errors": {
@@ -69,23 +71,38 @@ func TestLogin(t *testing.T) {
 			ExpectContains: []string{
 				`action="/"`,
 				`name="then" value="foo"`,
-				`An unknown error has occurred`,
+				`An authentication error occurred.`,
 				`danger`,
 			},
+		},
+		"redirect when GET has no then param": {
+			CSRF: &csrf.FakeCSRF{Token: "test"},
+			Auth: &testAuth{},
+			Path: "/login",
+
+			ExpectStatusCode: 302,
+			ExpectRedirect:   "/",
+		},
+		"redirect when POST is missing then param": {
+			CSRF:           &csrf.FakeCSRF{Token: "test"},
+			Auth:           &testAuth{},
+			Path:           "/login",
+			PostValues:     url.Values{"csrf": []string{"test"}},
+			ExpectRedirect: "/",
 		},
 		"redirect when POST fails CSRF": {
 			CSRF:           &csrf.FakeCSRF{Token: "test"},
 			Auth:           &testAuth{},
 			Path:           "/login",
 			PostValues:     url.Values{"csrf": []string{"wrong"}},
-			ExpectRedirect: "/login?reason=token+expired",
+			ExpectRedirect: "/login?reason=token_expired",
 		},
 		"redirect with 'then' when POST fails CSRF": {
 			CSRF:           &csrf.FakeCSRF{Token: "test"},
 			Auth:           &testAuth{},
 			Path:           "/login?then=test",
 			PostValues:     url.Values{"csrf": []string{"wrong"}},
-			ExpectRedirect: "/login?reason=token+expired&then=test",
+			ExpectRedirect: "/login?reason=token_expired&then=test",
 		},
 		"redirect when no username": {
 			CSRF: &csrf.FakeCSRF{Token: "test"},
@@ -93,8 +110,9 @@ func TestLogin(t *testing.T) {
 			Path: "/login",
 			PostValues: url.Values{
 				"csrf": []string{"test"},
+				"then": []string{"anotherurl"},
 			},
-			ExpectRedirect: "/login?reason=user+required",
+			ExpectRedirect: "/login?reason=user_required&then=anotherurl",
 		},
 		"redirect when not authenticated": {
 			CSRF: &csrf.FakeCSRF{Token: "test"},
@@ -103,8 +121,9 @@ func TestLogin(t *testing.T) {
 			PostValues: url.Values{
 				"csrf":     []string{"test"},
 				"username": []string{"user"},
+				"then":     []string{"anotherurl"},
 			},
-			ExpectRedirect: "/login?reason=access+denied",
+			ExpectRedirect: "/login?reason=access_denied&then=anotherurl",
 		},
 		"redirect on auth error": {
 			CSRF: &csrf.FakeCSRF{Token: "test"},
@@ -113,8 +132,31 @@ func TestLogin(t *testing.T) {
 			PostValues: url.Values{
 				"csrf":     []string{"test"},
 				"username": []string{"user"},
+				"then":     []string{"anotherurl"},
 			},
-			ExpectRedirect: "/login?reason=unknown+error",
+			ExpectRedirect: "/login?reason=authentication_error&then=anotherurl",
+		},
+		"redirect on lookup error": {
+			CSRF: &csrf.FakeCSRF{Token: "test"},
+			Auth: &testAuth{Err: identitymapper.NewLookupError(nil, nil)},
+			Path: "/login",
+			PostValues: url.Values{
+				"csrf":     []string{"test"},
+				"username": []string{"user"},
+				"then":     []string{"anotherurl"},
+			},
+			ExpectRedirect: "/login?reason=mapping_lookup_error&then=anotherurl",
+		},
+		"redirect on claim error": {
+			CSRF: &csrf.FakeCSRF{Token: "test"},
+			Auth: &testAuth{Err: identitymapper.NewClaimError(nil, nil)},
+			Path: "/login",
+			PostValues: url.Values{
+				"csrf":     []string{"test"},
+				"username": []string{"user"},
+				"then":     []string{"anotherurl"},
+			},
+			ExpectRedirect: "/login?reason=mapping_claim_error&then=anotherurl",
 		},
 		"redirect preserving then param": {
 			CSRF: &csrf.FakeCSRF{Token: "test"},
@@ -125,7 +167,7 @@ func TestLogin(t *testing.T) {
 				"username": []string{"user"},
 				"then":     []string{"anotherurl"},
 			},
-			ExpectRedirect: "/login?reason=unknown+error&then=anotherurl",
+			ExpectRedirect: "/login?reason=authentication_error&then=anotherurl",
 		},
 		"login successful": {
 			CSRF: &csrf.FakeCSRF{Token: "test"},
@@ -145,7 +187,7 @@ func TestLogin(t *testing.T) {
 			t.Errorf("%s: unexpected error: %v", k, err)
 			continue
 		}
-		server := httptest.NewServer(NewLogin(testCase.CSRF, testCase.Auth, loginFormRenderer))
+		server := httptest.NewServer(NewLogin("myprovider", testCase.CSRF, testCase.Auth, loginFormRenderer))
 
 		var resp *http.Response
 		if testCase.PostValues != nil {
@@ -190,7 +232,7 @@ func TestLogin(t *testing.T) {
 			body := string(data)
 			for i := range testCase.ExpectContains {
 				if !strings.Contains(body, testCase.ExpectContains[i]) {
-					t.Errorf("%s: did not find expected value %s: %s", k, testCase.ExpectContains[i], body)
+					t.Errorf("%s: did not find expected value %s", k, testCase.ExpectContains[i])
 					continue
 				}
 			}
@@ -233,7 +275,8 @@ func TestValidateLoginTemplate(t *testing.T) {
 	}
 }
 
-// Make sure the original template for login customizations always validates.
+// Make sure the original version of the default template always validates
+// this is to avoid breaking existing customized templates.
 const originalLoginTemplateExample = `<!DOCTYPE html>
 <!--
 

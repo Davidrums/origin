@@ -9,50 +9,49 @@ import (
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/kubectl"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
 	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util"
 	utilerrors "k8s.io/kubernetes/pkg/util/errors"
 
+	"github.com/openshift/origin/pkg/cmd/templates"
+	cmdutil "github.com/openshift/origin/pkg/cmd/util"
 	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
 	templateapi "github.com/openshift/origin/pkg/template/api"
 )
 
-const (
-	exportLong = `
-Export resources so they can be used elsewhere
+var (
+	exportLong = templates.LongDesc(`
+		Export resources so they can be used elsewhere
 
-The export command makes it easy to take existing objects and convert them to configuration files
-for backups or for creating elsewhere in the cluster. Fields that cannot be specified on create
-will be set to empty, and any field which is assigned on creation (like a service's clusterIP, or
-a deployment config's latestVersion). The status part of objects is also cleared.
+		The export command makes it easy to take existing objects and convert them to configuration files
+		for backups or for creating elsewhere in the cluster. Fields that cannot be specified on create
+		will be set to empty, and any field which is assigned on creation (like a service's clusterIP, or
+		a deployment config's latestVersion). The status part of objects is also cleared.
 
-Some fields like clusterIP may be useful when exporting an application from one cluster to apply
-to another - assuming another service on the destination cluster does not already use that IP.
-The --exact flag will instruct export to not clear fields that might be useful. You may also use
---raw to get the exact values for an object - useful for converting a file on disk between API
-versions.
+		Some fields like clusterIP may be useful when exporting an application from one cluster to apply
+		to another - assuming another service on the destination cluster does not already use that IP.
+		The --exact flag will instruct export to not clear fields that might be useful. You may also use
+		--raw to get the exact values for an object - useful for converting a file on disk between API
+		versions.
 
-Another use case for export is to create reusable templates for applications. Pass --as-template
-to generate the API structure for a template to which you can add parameters and object labels.`
+		Another use case for export is to create reusable templates for applications. Pass --as-template
+		to generate the API structure for a template to which you can add parameters and object labels.`)
 
-	exportExample = `  // export the services and deployment configurations labeled name=test
-  %[1]s export svc,dc -l name=test
+	exportExample = templates.Examples(`
+		# export the services and deployment configurations labeled name=test
+	  %[1]s export svc,dc -l name=test
 
-  // export all services to a template
-  %[1]s export service --as-template=test
+	  # export all services to a template
+	  %[1]s export service --as-template=test
 
-  // export to JSON
-  %[1]s export service -o json
-
-  // convert a file on disk to the latest API version (in YAML, the default)
-  %[1]s export -f a_v1beta3_service.json --output-version=v1 --exact`
+	  # export to JSON
+	  %[1]s export service -o json`)
 )
 
 func NewCmdExport(fullName string, f *clientcmd.Factory, in io.Reader, out io.Writer) *cobra.Command {
-	exporter := &defaultExporter{}
-	var filenames util.StringList
+	exporter := &DefaultExporter{}
+	var filenames []string
 	cmd := &cobra.Command{
 		Use:     "export RESOURCE/NAME ... [options]",
 		Short:   "Export resources so they can be used elsewhere",
@@ -60,40 +59,43 @@ func NewCmdExport(fullName string, f *clientcmd.Factory, in io.Reader, out io.Wr
 		Example: fmt.Sprintf(exportExample, fullName),
 		Run: func(cmd *cobra.Command, args []string) {
 			err := RunExport(f, exporter, in, out, cmd, args, filenames)
-			if err == errExit {
+			if err == cmdutil.ErrExit {
 				os.Exit(1)
 			}
-			cmdutil.CheckErr(err)
+			kcmdutil.CheckErr(err)
 		},
 	}
 	cmd.Flags().String("as-template", "", "Output a Template object with specified name instead of a List or single object.")
-	cmd.Flags().Bool("exact", false, "Preserve fields that may be cluster specific, such as service portalIPs or generated names")
+	cmd.Flags().Bool("exact", false, "If true, preserve fields that may be cluster specific, such as service clusterIPs or generated names")
 	cmd.Flags().Bool("raw", false, "If true, do not alter the resources in any way after they are loaded.")
 	cmd.Flags().StringP("selector", "l", "", "Selector (label query) to filter on")
-	cmd.Flags().Bool("all-namespaces", false, "If present, list the requested object(s) across all namespaces. Namespace in current context is ignored even if specified with --namespace.")
-	cmd.Flags().VarP(&filenames, "filename", "f", "Filename, directory, or URL to file to use to edit the resource.")
-
-	cmd.Flags().Bool("all", true, "Select all resources in the namespace of the specified resource types")
+	cmd.Flags().Bool("all-namespaces", false, "If true, list the requested object(s) across all namespaces. Namespace in current context is ignored even if specified with --namespace.")
+	cmd.Flags().StringSliceVarP(&filenames, "filename", "f", filenames, "Filename, directory, or URL to file for the resource to export.")
+	cmd.MarkFlagFilename("filename")
+	cmd.Flags().Bool("all", true, "DEPRECATED: all is ignored, specifying a resource without a name selects all the instances of that resource")
 	cmd.Flags().MarkDeprecated("all", "all is ignored because specifying a resource without a name selects all the instances of that resource")
-	cmdutil.AddPrinterFlags(cmd)
+	kcmdutil.AddPrinterFlags(cmd)
 	return cmd
 }
 
-func RunExport(f *clientcmd.Factory, exporter Exporter, in io.Reader, out io.Writer, cmd *cobra.Command, args []string, filenames util.StringList) error {
-	selector := cmdutil.GetFlagString(cmd, "selector")
-	allNamespaces := cmdutil.GetFlagBool(cmd, "all-namespaces")
-	exact := cmdutil.GetFlagBool(cmd, "exact")
-	asTemplate := cmdutil.GetFlagString(cmd, "as-template")
-	raw := cmdutil.GetFlagBool(cmd, "raw")
+func RunExport(f *clientcmd.Factory, exporter Exporter, in io.Reader, out io.Writer, cmd *cobra.Command, args []string, filenames []string) error {
+	selector := kcmdutil.GetFlagString(cmd, "selector")
+	allNamespaces := kcmdutil.GetFlagBool(cmd, "all-namespaces")
+	exact := kcmdutil.GetFlagBool(cmd, "exact")
+	asTemplate := kcmdutil.GetFlagString(cmd, "as-template")
+	raw := kcmdutil.GetFlagBool(cmd, "raw")
 	if exact && raw {
-		return cmdutil.UsageError(cmd, "--exact and --raw may not both be specified")
+		return kcmdutil.UsageError(cmd, "--exact and --raw may not both be specified")
 	}
 
 	clientConfig, err := f.ClientConfig()
 	if err != nil {
 		return err
 	}
-	outputVersion := cmdutil.OutputVersion(cmd, clientConfig.Version)
+	outputVersion, err := kcmdutil.OutputVersion(cmd, clientConfig.GroupVersion)
+	if err != nil {
+		return err
+	}
 
 	cmdNamespace, explicit, err := f.DefaultNamespace()
 	if err != nil {
@@ -101,15 +103,15 @@ func RunExport(f *clientcmd.Factory, exporter Exporter, in io.Reader, out io.Wri
 	}
 
 	mapper, typer := f.Object()
-	b := resource.NewBuilder(mapper, typer, f.ClientMapperForCommand()).
+	b := resource.NewBuilder(mapper, typer, resource.ClientMapperFunc(f.ClientForMapping), kapi.Codecs.UniversalDecoder()).
 		NamespaceParam(cmdNamespace).DefaultNamespace().AllNamespaces(allNamespaces).
-		FilenameParam(explicit, filenames...).
+		FilenameParam(explicit, &resource.FilenameOptions{Recursive: false, Filenames: filenames}).
 		SelectorParam(selector).
 		ResourceTypeOrNameArgs(true, args...).
 		Flatten()
 
 	one := false
-	infos, err := b.Do().IntoSingular(&one).Infos()
+	infos, err := b.Do().IntoSingleItemImplied(&one).Infos()
 	if err != nil {
 		return err
 	}
@@ -138,7 +140,7 @@ func RunExport(f *clientcmd.Factory, exporter Exporter, in io.Reader, out io.Wri
 
 	var result runtime.Object
 	if len(asTemplate) > 0 {
-		objects, err := resource.AsVersionedObjects(infos, outputVersion)
+		objects, err := resource.AsVersionedObjects(infos, outputVersion, kapi.Codecs.LegacyCodec(outputVersion))
 		if err != nil {
 			return err
 		}
@@ -151,7 +153,7 @@ func RunExport(f *clientcmd.Factory, exporter Exporter, in io.Reader, out io.Wri
 			return err
 		}
 	} else {
-		object, err := resource.AsVersionedObject(infos, !one, outputVersion)
+		object, err := resource.AsVersionedObject(infos, !one, outputVersion, kapi.Codecs.LegacyCodec(outputVersion))
 		if err != nil {
 			return err
 		}
@@ -159,15 +161,15 @@ func RunExport(f *clientcmd.Factory, exporter Exporter, in io.Reader, out io.Wri
 	}
 
 	// use YAML as the default format
-	outputFormat := cmdutil.GetFlagString(cmd, "output")
-	templateFile := cmdutil.GetFlagString(cmd, "template")
+	outputFormat := kcmdutil.GetFlagString(cmd, "output")
+	templateFile := kcmdutil.GetFlagString(cmd, "template")
 	if len(outputFormat) == 0 && len(templateFile) != 0 {
 		outputFormat = "template"
 	}
 	if len(outputFormat) == 0 {
 		outputFormat = "yaml"
 	}
-	p, _, err := kubectl.GetPrinter(outputFormat, templateFile)
+	p, _, err := kubectl.GetPrinter(outputFormat, templateFile, kcmdutil.GetFlagBool(cmd, "no-headers"), kcmdutil.GetFlagBool(cmd, "allow-missing-template-keys"))
 	if err != nil {
 		return err
 	}

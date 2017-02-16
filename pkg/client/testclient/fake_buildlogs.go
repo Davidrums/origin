@@ -1,9 +1,8 @@
 package testclient
 
 import (
-	kclient "k8s.io/kubernetes/pkg/client"
-
-	ktestclient "k8s.io/kubernetes/pkg/client/testclient"
+	"k8s.io/kubernetes/pkg/client/restclient"
+	"k8s.io/kubernetes/pkg/client/testing/core"
 
 	buildapi "github.com/openshift/origin/pkg/build/api"
 )
@@ -15,14 +14,14 @@ type FakeBuildLogs struct {
 	Namespace string
 }
 
-func (c *FakeBuildLogs) Get(name string, opt buildapi.BuildLogOptions) *kclient.Request {
-	action := ktestclient.GenericActionImpl{}
+func (c *FakeBuildLogs) Get(name string, opt buildapi.BuildLogOptions) *restclient.Request {
+	action := core.GenericActionImpl{}
 	action.Verb = "get"
 	action.Namespace = c.Namespace
-	action.Resource = "builds"
-	action.Subresource = "logs"
+	action.Resource = buildsResource
+	action.Subresource = "log"
 	action.Value = opt
 
 	_, _ = c.Fake.Invokes(action, &buildapi.BuildConfig{})
-	return &kclient.Request{}
+	return &restclient.Request{}
 }

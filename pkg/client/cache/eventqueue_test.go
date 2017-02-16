@@ -58,7 +58,7 @@ func TestEventQueue_initialEventIsDelete(t *testing.T) {
 
 	q.Replace([]interface{}{
 		cacheable{"foo", 2},
-	})
+	}, "1")
 
 	q.Delete(cacheable{key: "foo"})
 
@@ -115,7 +115,7 @@ func TestEventQueue_compressTwoUpdates(t *testing.T) {
 
 	q.Replace([]interface{}{
 		cacheable{"foo", 2},
-	})
+	}, "1")
 
 	q.Update(cacheable{"foo", 3})
 	q.Update(cacheable{"foo", 4})
@@ -136,7 +136,7 @@ func TestEventQueue_compressUpdateDelete(t *testing.T) {
 
 	q.Replace([]interface{}{
 		cacheable{"foo", 2},
-	})
+	}, "1")
 
 	q.Update(cacheable{"foo", 3})
 	q.Delete(cacheable{key: "foo"})
@@ -157,7 +157,7 @@ func TestEventQueue_modifyEventsFromReplace(t *testing.T) {
 
 	q.Replace([]interface{}{
 		cacheable{"foo", 2},
-	})
+	}, "1")
 
 	q.Update(cacheable{"foo", 2})
 
@@ -169,5 +169,39 @@ func TestEventQueue_modifyEventsFromReplace(t *testing.T) {
 
 	if event != watch.Modified {
 		t.Fatalf("expected %s, got %s", watch.Modified, event)
+	}
+}
+
+func TestEventQueue_ListConsumed(t *testing.T) {
+	q := NewEventQueue(keyFunc)
+	if !q.ListConsumed() {
+		t.Fatalf("expected ListConsumed to be true after queue creation")
+	}
+
+	q.Replace([]interface{}{}, "1")
+	if !q.ListConsumed() {
+		t.Fatalf("expected ListConsumed to be true after Replace() without items")
+	}
+
+	items := []interface{}{
+		cacheable{"foo", 2},
+	}
+	q.Replace(items, "1")
+	if q.ListConsumed() {
+		t.Fatalf("expected ListConsumed to be false after Replace() with items")
+	}
+
+	// Delete() only results in the removal of a queued item if it is
+	// of event type watch.Add.  Since items added by Replace() are of
+	// type watch.Modified, calling Delete() on those items will
+	// change the event type but not remove them from the queue.
+	q.Delete(items[0])
+	if q.ListConsumed() {
+		t.Fatalf("expected ListConsumed to be false after Delete()")
+	}
+
+	q.Pop()
+	if !q.ListConsumed() {
+		t.Fatalf("expected ListConsumed to be true after queued items read")
 	}
 }

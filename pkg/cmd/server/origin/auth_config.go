@@ -2,22 +2,23 @@ package origin
 
 import (
 	"crypto/md5"
-	"crypto/x509"
 	"fmt"
 	"net/url"
 
-	"code.google.com/p/go-uuid/uuid"
+	"github.com/pborman/uuid"
 
+	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/storage"
 
 	"github.com/openshift/origin/pkg/auth/server/session"
+	osclient "github.com/openshift/origin/pkg/client"
 	configapi "github.com/openshift/origin/pkg/cmd/server/api"
 	"github.com/openshift/origin/pkg/cmd/server/api/latest"
-	"github.com/openshift/origin/pkg/cmd/server/etcd"
 	identityregistry "github.com/openshift/origin/pkg/user/registry/identity"
 	identityetcd "github.com/openshift/origin/pkg/user/registry/identity/etcd"
 	userregistry "github.com/openshift/origin/pkg/user/registry/user"
 	useretcd "github.com/openshift/origin/pkg/user/registry/user/etcd"
+	"github.com/openshift/origin/pkg/util/restoptions"
 )
 
 type AuthConfig struct {
@@ -25,76 +26,91 @@ type AuthConfig struct {
 
 	// AssetPublicAddresses contains valid redirectURI prefixes to direct browsers to the web console
 	AssetPublicAddresses []string
-	MasterRoots          *x509.CertPool
-	EtcdHelper           storage.Interface
+
+	// KubeClient is kubeclient with enough permission for the auth API
+	KubeClient kclientset.Interface
+
+	// OpenShiftClient is osclient with enough permission for the auth API
+	OpenShiftClient osclient.Interface
+
+	// RESTOptionsGetter provides storage and RESTOption lookup
+	RESTOptionsGetter restoptions.Getter
+
+	// EtcdBackends is a list of storage interfaces, each of which talks to a single etcd backend.
+	// These are only used to ensure newly created tokens are distributed to all backends before returning them for use.
+	// EtcdHelper should normally be used for storage functions.
+	EtcdBackends []storage.Interface
 
 	UserRegistry     userregistry.Registry
 	IdentityRegistry identityregistry.Registry
 
 	SessionAuth *session.Authenticator
+
+	HandlerWrapper handlerWrapper
 }
 
-func BuildAuthConfig(options configapi.MasterConfig) (*AuthConfig, error) {
-	client, err := etcd.EtcdClient(options.EtcdClientInfo)
-	if err != nil {
-		return nil, err
-	}
-	etcdHelper, err := NewEtcdStorage(client, options.EtcdStorageConfig.OpenShiftStorageVersion, options.EtcdStorageConfig.OpenShiftStoragePrefix)
-	if err != nil {
-		return nil, fmt.Errorf("Error setting up server storage: %v", err)
-	}
-
-	apiServerCAs, err := configapi.GetAPIServerCertCAPool(options)
-	if err != nil {
-		return nil, err
-	}
+func BuildAuthConfig(masterConfig *MasterConfig) (*AuthConfig, error) {
+	options := masterConfig.Options
+	osClient, kubeClient := masterConfig.OAuthServerClients()
 
 	var sessionAuth *session.Authenticator
+	var sessionHandlerWrapper handlerWrapper
 	if options.OAuthConfig.SessionConfig != nil {
 		secure := isHTTPS(options.OAuthConfig.MasterPublicURL)
-		auth, err := BuildSessionAuth(secure, options.OAuthConfig.SessionConfig)
+		auth, wrapper, err := buildSessionAuth(secure, options.OAuthConfig.SessionConfig)
 		if err != nil {
 			return nil, err
 		}
 		sessionAuth = auth
+		sessionHandlerWrapper = wrapper
 	}
 
 	// Build the list of valid redirect_uri prefixes for a login using the openshift-web-console client to redirect to
-	// TODO: allow configuring this
-	// TODO: remove hard-coding of development UI server
 	assetPublicURLs := []string{}
 	if !options.DisabledFeatures.Has(configapi.FeatureWebConsole) {
-		assetPublicURLs = []string{options.OAuthConfig.AssetPublicURL, "http://localhost:9000", "https://localhost:9000"}
+		assetPublicURLs = []string{options.OAuthConfig.AssetPublicURL}
 	}
 
-	userStorage := useretcd.NewREST(etcdHelper)
+	userStorage, err := useretcd.NewREST(masterConfig.RESTOptionsGetter)
+	if err != nil {
+		return nil, err
+	}
 	userRegistry := userregistry.NewRegistry(userStorage)
-	identityStorage := identityetcd.NewREST(etcdHelper)
+
+	identityStorage, err := identityetcd.NewREST(masterConfig.RESTOptionsGetter)
+	if err != nil {
+		return nil, err
+	}
 	identityRegistry := identityregistry.NewRegistry(identityStorage)
 
 	ret := &AuthConfig{
 		Options: *options.OAuthConfig,
 
+		KubeClient: kubeClient,
+
+		OpenShiftClient: osClient,
+
 		AssetPublicAddresses: assetPublicURLs,
-		MasterRoots:          apiServerCAs,
-		EtcdHelper:           etcdHelper,
+		RESTOptionsGetter:    masterConfig.RESTOptionsGetter,
 
 		IdentityRegistry: identityRegistry,
 		UserRegistry:     userRegistry,
 
 		SessionAuth: sessionAuth,
+
+		HandlerWrapper: sessionHandlerWrapper,
 	}
 
 	return ret, nil
 }
 
-func BuildSessionAuth(secure bool, config *configapi.SessionConfig) (*session.Authenticator, error) {
+func buildSessionAuth(secure bool, config *configapi.SessionConfig) (*session.Authenticator, handlerWrapper, error) {
 	secrets, err := getSessionSecrets(config.SessionSecretsFile)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sessionStore := session.NewStore(secure, int(config.SessionMaxAgeSeconds), secrets...)
-	return session.NewAuthenticator(sessionStore, config.SessionName), nil
+	return session.NewAuthenticator(sessionStore, config.SessionName), sessionStore, nil
 }
 
 func getSessionSecrets(filename string) ([]string, error) {

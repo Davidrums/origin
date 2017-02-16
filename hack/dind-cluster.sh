@@ -1,12 +1,8 @@
 #!/bin/bash
 
-# WARNING: The script modifies the host on which it is run.  It loads
-# the openvwitch and br_netfilter modules, sets
-# net.bridge.bridge-nf-call-iptables=0, and creates 2 loopback devices
-# for each non-master node.  Consider creating dind clusters in a VM
-# if this modification is undesirable:
-#
-#   OPENSHIFT_DIND_DEV_CLUSTER=1 vagrant up'
+# WARNING: The script modifies the host that docker is running on.  It
+# attempts to load the overlay and openvswitch modules. If this modification
+# is undesirable consider running docker in a VM.
 #
 # Overview
 # ========
@@ -20,7 +16,7 @@
 # Dependencies
 # ------------
 #
-# This script has been tested on Fedora 22, but should work on any
+# This script has been tested on Fedora 24, but should work on any
 # release.  Docker is assumed to be installed.  At this time,
 # boot2docker is not supported.
 #
@@ -31,107 +27,162 @@
 # to enforcing mode.  Set selinux to permissive or disable it
 # entirely.
 #
-# Vagrant Dev Cluster
-# -------------------
+# OpenShift Configuration
+# -----------------------
 #
-# At present the dind setup uses the same config (./openshift.local.*)
-# as a vagrant-deployed cluster, so it is not possible to run both a
-# vm-based dev cluster and a dind-based dev cluster from a given repo
-# clone.  Until this is fixed, it is necessary to run only a vm or
-# dind-based cluster at a time, or run them from separate repos.
+# By default, a dind openshift cluster stores its configuration
+# (openshift.local.*) in /tmp/openshift-dind-cluster/openshift.  It's
+# possible to run multiple dind clusters simultaneously by overriding
+# the instance prefix.  The following command would ensure
+# configuration was stored at /tmp/openshift-dind/cluster/my-cluster:
 #
-# Bash Aliases
-# ------------
+#    OPENSHIFT_CLUSTER_ID=my-cluster hack/dind-cluster.sh [command]
 #
-# The following bash aliases are available in the cluster containers:
-#
-# oc-create-hello - create the 'hello' example app
-# oc-less-log - invoke 'less' on the openshift daemon log (will target
-#               the master or node log depending on the type of node)
-# oc-tail-log - invoke tail on the openshift daemon log
-#
-# Process Management
+# Suggested Workflow
 # ------------------
 #
-# Due to docker-in-docker conflicting with systemd when running in a
-# container, supervisord is used instead.  The 'supervisorctl' command
-# is the equivalent of 'systemctl' and logs for managed processes can
-# be found in /var/log/supervisor.
+# When making changes to the deployment of a dind cluster or making
+# breaking golang changes, the 'restart' command will ensure that an
+# existing cluster is cleaned up before deploying a new cluster.
 #
-# Loopback Devices
-# ----------------
+# Running Tests
+# -------------
 #
-# Due to the way docker-in-docker daemons interact with loopback
-# devices, it is important to invoke 'dind-cluster.sh stop' on a
-# running cluster instead of manually stopping the containers.  This
-# ensures that the containerized docker daemons are gracefully
-# shutdown and allowed to release their loopback devices before
-# container shutdown.  If the daemons are not stopped before container
-# shutdown, the associated loopback devices will be effectively
-# unusable ('leaked') until a subsequent host reboot.  If enough
-# loopback devices are leaked, cluster boot may not be possible since
-# each openshift node running in a container depends on a docker
-# daemon requiring 2 loopback devices.
+# The extended tests can be run against a dind cluster as follows:
+#
+#     OPENSHIFT_CONFIG_ROOT=dind test/extended/networking.sh
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-source $(dirname "${BASH_SOURCE}")/dind/init.sh
+source "$(dirname "${BASH_SOURCE}")/lib/init.sh"
+source "${OS_ROOT}/images/dind/node/openshift-dind-lib.sh"
+
+function start() {
+  local origin_root=$1
+  local config_root=$2
+  local deployed_config_root=$3
+  local cluster_id=$4
+  local network_plugin=$5
+  local wait_for_cluster=$6
+  local node_count=$7
+
+  # docker-in-docker's use of volumes is not compatible with SELinux
+  check-selinux
+
+  echo "Starting dind cluster '${cluster_id}' with plugin '${network_plugin}'"
+
+  # Ensuring compatible host configuration
+  #
+  # Running in a container ensures that the docker host will be affected even
+  # if docker is running remotely.  The openshift/dind-node image was chosen
+  # due to its having sysctl installed.
+  ${DOCKER_CMD} run --privileged --net=host --rm -v /lib/modules:/lib/modules \
+                openshift/dind-node bash -e -c \
+                '/usr/sbin/modprobe openvswitch;
+                /usr/sbin/modprobe overlay 2> /dev/null || true;'
+
+  # Initialize the cluster config path
+  mkdir -p "${config_root}"
+  echo "OPENSHIFT_NETWORK_PLUGIN=${network_plugin}" > "${config_root}/network-plugin"
+  copy-runtime "${origin_root}" "${config_root}/"
+
+  local volumes="-v ${config_root}:${deployed_config_root}"
+  local run_cmd="${DOCKER_CMD} run -dt ${volumes}  --privileged"
+
+  # Create containers
+  ${run_cmd} --name="${MASTER_NAME}" --hostname="${MASTER_NAME}" "${MASTER_IMAGE}" > /dev/null
+  for name in "${NODE_NAMES[@]}"; do
+    ${run_cmd} --name="${name}" --hostname="${name}" "${NODE_IMAGE}" > /dev/null
+  done
+
+  local rc_file="dind-${cluster_id}.rc"
+  local admin_config
+  admin_config="$(get-admin-config "${CONFIG_ROOT}")"
+  local bin_path
+  bin_path="$(os::build::get-bin-output-path "${OS_ROOT}")"
+  cat >"${rc_file}" <<EOF
+export KUBECONFIG=${admin_config}
+export PATH=\$PATH:${bin_path}
+EOF
+
+  if [[ -n "${wait_for_cluster}" ]]; then
+    wait-for-cluster "${config_root}" "${node_count}"
+  fi
+
+  if [[ "${KUBECONFIG:-}" != "${admin_config}"  ||
+          ":${PATH}:" != *":${bin_path}:"* ]]; then
+    echo ""
+    echo "Before invoking the openshift cli, make sure to source the
+cluster's rc file to configure the bash environment:
+
+  $ . ${rc_file}
+  $ oc get nodes
+"
+  fi
+}
+
+function stop() {
+  local config_root=$1
+  local cluster_id=$2
+
+  echo "Stopping dind cluster '${cluster_id}'"
+
+  local master_cid
+  master_cid="$(${DOCKER_CMD} ps -qa --filter "name=${MASTER_NAME}")"
+  if [[ "${master_cid}" ]]; then
+    ${DOCKER_CMD} rm -f "${master_cid}" > /dev/null
+  fi
+
+  local node_cids
+  node_cids="$(${DOCKER_CMD} ps -qa --filter "name=${NODE_PREFIX}")"
+  if [[ "${node_cids}" ]]; then
+    node_cids=(${node_cids//\n/ })
+    for cid in "${node_cids[@]}"; do
+      ${DOCKER_CMD} rm -f "${cid}" > /dev/null
+    done
+  fi
+
+  # Cleaning up configuration to avoid conflict with a future cluster
+  # The container will have created configuration as root
+  sudo rm -rf "${config_root}"/openshift.local.etcd
+  sudo rm -rf "${config_root}"/openshift.local.config
+
+  # Cleanup orphaned volumes
+  #
+  # See: https://github.com/jpetazzo/dind#important-warning-about-disk-usage
+  #
+  for volume in $( ${DOCKER_CMD} volume ls -qf dangling=true ); do
+    ${DOCKER_CMD} volume rm "${volume}" > /dev/null
+  done
+}
 
 function check-selinux() {
-  if [ "$(getenforce)" = "Enforcing" ]; then
+  if [[ "$(getenforce)" = "Enforcing" ]]; then
     >&2 echo "Error: This script is not compatible with SELinux enforcing mode."
     exit 1
   fi
 }
 
-IMAGE_REPO="${OS_DIND_IMAGE_REPO:-}"
-IMAGE_TAG="${OS_DIND_IMAGE_TAG:-}"
-function get-image-name() {
-  local name=$1
+function get-network-plugin() {
+  local plugin=$1
 
-  echo "${IMAGE_REPO}openshift/dind-${name}${IMAGE_TAG}"
-}
+  local subnet_plugin="redhat/openshift-ovs-subnet"
+  local multitenant_plugin="redhat/openshift-ovs-multitenant"
+  local networkpolicy_plugin="redhat/openshift-ovs-networkpolicy"
+  local default_plugin="${multitenant_plugin}"
 
-BASE_IMAGE=$(get-image-name base)
-MASTER_IMAGE=$(get-image-name master)
-NODE_IMAGE=$(get-image-name node)
-BUILD_IMAGES="${OS_DIND_BUILD_IMAGES:-1}"
-
-function build-image() {
-  local build_root=$1
-  local image_name=$2
-
-  pushd "${build_root}"
-  ${DOCKER_CMD} build -t "${image_name}" .
-  popd
-}
-
-function build-images() {
-  # Building images is done by default but can be disabled to allow
-  # separation of image build from cluster creation.
-  if [ "${BUILD_IMAGES}" = "1" ]; then
-    echo "Building container images"
-    if [ "${IMAGE_REPO}" != "" ]; then
-      # Failure to cache is assumed to not be worth failing the build.
-      ${DOCKER_CMD} pull "${BASE_IMAGE}" || true
-      ${DOCKER_CMD} pull "${MASTER_IMAGE}" || true
-      ${DOCKER_CMD} pull "${NODE_IMAGE}" || true
+  if [[ "${plugin}" != "${subnet_plugin}" &&
+          "${plugin}" != "${multitenant_plugin}" &&
+          "${plugin}" != "${networkpolicy_plugin}" &&
+          "${plugin}" != "cni" ]]; then
+    if [[ -n "${plugin}" ]]; then
+      >&2 echo "Invalid network plugin: ${plugin}"
     fi
-    build-image "${ORIGIN_ROOT}/images/dind/base" "${BASE_IMAGE}"
-    if [ "${IMAGE_REPO}" != "" ]; then
-      # Tag the base image for use by master and node image builds
-      ${DOCKER_CMD} tag "${BASE_IMAGE}" "openshift/dind-base" || true
-    fi
-    build-image "${ORIGIN_ROOT}/images/dind/master" "${MASTER_IMAGE}"
-    build-image "${ORIGIN_ROOT}/images/dind/node" "${NODE_IMAGE}"
-    if [ "${IMAGE_REPO}" != "" ]; then
-      ${DOCKER_CMD} push "${BASE_IMAGE}" || true
-      ${DOCKER_CMD} push "${MASTER_IMAGE}" || true
-      ${DOCKER_CMD} push "${NODE_IMAGE}" || true
-    fi
+    plugin="${default_plugin}"
   fi
+  echo "${plugin}"
 }
 
 function get-docker-ip() {
@@ -140,148 +191,189 @@ function get-docker-ip() {
   ${DOCKER_CMD} inspect --format '{{ .NetworkSettings.IPAddress }}' "${cid}"
 }
 
-# Ensure sufficient available loopback devices to support the
-# indicated number of dind nodes.  Since it's not possible to create
-# device nodes inside a container, this function needs to be called
-# before launching a container that will run dind.
-function ensure-loopback-for-dind() {
-  local node_count=$1
+function get-admin-config() {
+  local config_root=$1
 
-  # Ensure extra loopback devices to minimize the potential for
-  # contention.  Sometimes docker restarts during deployment don't
-  # properly release the devices.
-  local extra_loopback=4
-  local loopback_per_node=2
-  local required_free_loopback=$(( ( ${node_count} * ${loopback_per_node} ) + \
-    ${extra_loopback} ))
-
-  # Find the maximum index of existing loopback devices.
-  local max_index=$(losetup | grep '/dev/loop' | tail -n 1 |
-    sed -e 's|^/dev/loop\([0-9]\{1,\}\).*|\1|')
-  if [ -z "${max_index}" ]; then
-    max_index=0
-  fi
-
-  local requested_max_index=$(( ${max_index} + ${required_free_loopback} - 1))
-  for i in $(eval echo "{${max_index}..${requested_max_index}}"); do
-    if [ ! -e "/dev/loop${i}" ]; then
-      sudo mknod "/dev/loop${i}" b 7 "${i}"
-    fi
-  done
+  echo "${config_root}/openshift.local.config/master/admin.kubeconfig"
 }
 
-function start() {
-  # docker-in-docker's use of volumes is not compatible with SELinux
-  check-selinux
+function copy-runtime() {
+  local origin_root=$1
+  local target=$2
 
-  echo "Ensuring compatible host configuration"
-  sudo modprobe openvswitch
-  sudo modprobe br_netfilter || true
-  sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
-  ensure-loopback-for-dind "${NUM_NODES}"
-
-  build-images
-
-  ## Create containers
-  echo "Launching containers"
-  local base_run_cmd="${DOCKER_CMD} run -dt -v ${ORIGIN_ROOT}:${DEPLOYED_ROOT}"
-
-  local master_cid=$(${base_run_cmd} --name="${MASTER_NAME}" \
-    --hostname="${MASTER_NAME}" "${MASTER_IMAGE}")
-  local master_ip=$(get-docker-ip "${master_cid}")
-
-  local node_cids=()
-  local node_ips=()
-  for name in "${NODE_NAMES[@]}"; do
-    local cid=$(${base_run_cmd} --privileged --name="${name}" \
-      --hostname="${name}" "${NODE_IMAGE}")
-    node_cids+=( "${cid}" )
-    node_ips+=( $(get-docker-ip "${cid}") )
-  done
-  node_ips=$(os::util::join , ${node_ips[@]})
-
-  ## Provision containers
-  echo "Provisioning ${MASTER_NAME}"
-  ${DOCKER_CMD} exec -t "${master_cid}" bash -c "\
-    ${SCRIPT_ROOT}/provision-master.sh \
-    ${master_ip} ${NUM_NODES} ${node_ips} ${MASTER_NAME} ${NETWORK_PLUGIN}"
-
-  for (( i=0; i < ${#node_cids[@]}; i++ )); do
-    local cid="${node_cids[$i]}"
-    local name="${NODE_NAMES[$i]}"
-    echo "Provisioning ${name}"
-    ${DOCKER_CMD} exec "${cid}" bash -c "\
-      ${SCRIPT_ROOT}/provision-node.sh \
-      ${master_ip} ${NUM_NODES} ${node_ips} ${name}"
-  done
+  cp "$(os::util::find::built_binary openshift)" "${target}"
+  cp "$(os::util::find::built_binary host-local)" "${target}"
+  cp "$(os::util::find::built_binary loopback)" "${target}"
+  cp "$(os::util::find::built_binary sdn-cni-plugin)" "${target}/openshift-sdn"
+  local osdn_plugin_path="${origin_root}/pkg/sdn/plugin"
+  cp "${osdn_plugin_path}/bin/openshift-sdn-ovs" "${target}"
+  cp "${osdn_plugin_path}/sdn-cni-plugin/80-openshift-sdn.conf" "${target}"
 }
 
-function stop() {
-  echo "Cleaning up docker-in-docker containers"
-  local master_cid=$(${DOCKER_CMD} ps -qa --filter "name=${MASTER_NAME}")
-  if [[ "${master_cid}" ]]; then
-    ${DOCKER_CMD} rm -f "${master_cid}"
-  fi
+function wait-for-cluster() {
+  local config_root=$1
+  local expected_node_count=$2
 
-  local node_cids=$(${DOCKER_CMD} ps -qa --filter "name=${NODE_PREFIX}")
-  if [[ "${node_cids}" ]]; then
-    node_cids=(${node_cids//\n/ })
-    for cid in "${node_cids[@]}"; do
-      # Ensure that the nested docker daemon is stopped before attempting
-      # container removal so associated loopback devices are properly
-      # released.
-      #
-      # See: https://github.com/jpetazzo/dind/issues/19
-      #
-      local is_running=$(${DOCKER_CMD} inspect -f {{.State.Running}} "${cid}")
-      if [ "${is_running}" = "true" ]; then
-        ${DOCKER_CMD} exec -t "${cid}" "${SCRIPT_ROOT}/kill-docker.sh"
-      fi
-      ${DOCKER_CMD} rm -f "${cid}"
-    done
-  fi
+  # Increment the node count to ensure that the sdn node also reports readiness
+  (( expected_node_count++ ))
 
-  # Volume cleanup is not compatible with SELinux
-  check-selinux
+  local kubeconfig
+  kubeconfig="$(get-admin-config "${config_root}")"
+  local oc
+  oc="$(os::util::find::built_binary oc)"
 
-  # Cleanup orphaned volumes
-  #
-  # See: https://github.com/jpetazzo/dind#important-warning-about-disk-usage
-  #
-  echo "Cleaning up volumes used by docker-in-docker daemons"
-  ${DOCKER_CMD} run -v /var/run/docker.sock:/var/run/docker.sock \
-    -v /var/lib/docker:/var/lib/docker --rm martin/docker-cleanup-volumes
+  # wait for healthz to report ok before trying to get nodes
+  os::util::wait-for-condition "ok" "${oc} get --config=${kubeconfig} --raw=/healthz" "120"
 
+  local msg="${expected_node_count} nodes to report readiness"
+  local condition="nodes-are-ready ${kubeconfig} ${oc} ${expected_node_count}"
+  local timeout=120
+  os::util::wait-for-condition "${msg}" "${condition}" "${timeout}"
 }
 
-function wipe-config() {
-  rm -rf "${ORIGIN_ROOT}/openshift.local.*"
+function nodes-are-ready() {
+  local kubeconfig=$1
+  local oc=$2
+  local expected_node_count=$3
+
+  # TODO - do not count any node whose name matches the master node e.g. 'node-master'
+  read -d '' template <<'EOF'
+{{range $item := .items}}
+  {{range .status.conditions}}
+    {{if eq .type "Ready"}}
+      {{if eq .status "True"}}
+        {{printf "%s\\n" $item.metadata.name}}
+      {{end}}
+    {{end}}
+  {{end}}
+{{end}}
+EOF
+  # Remove formatting before use
+  template="$(echo "${template}" | tr -d '\n' | sed -e 's/} \+/}/g')"
+  local count
+  count="$("${oc}" --config="${kubeconfig}" get nodes \
+                   --template "${template}" 2> /dev/null | \
+                   wc -l)"
+  test "${count}" -ge "${expected_node_count}"
 }
+
+function build-images() {
+  local origin_root=$1
+
+  echo "Building container images"
+  build-image "${origin_root}/images/dind/" "${BASE_IMAGE}"
+  build-image "${origin_root}/images/dind/node" "${NODE_IMAGE}"
+  build-image "${origin_root}/images/dind/master" "${MASTER_IMAGE}"
+}
+
+function build-image() {
+  local build_root=$1
+  local image_name=$2
+
+  pushd "${build_root}" > /dev/null
+    ${DOCKER_CMD} build -t "${image_name}" .
+  popd > /dev/null
+}
+
+DOCKER_CMD=${DOCKER_CMD:-"sudo docker"}
+
+CLUSTER_ID="${OPENSHIFT_CLUSTER_ID:-openshift}"
+
+TMPDIR="${TMPDIR:-"/tmp"}"
+CONFIG_ROOT="${OPENSHIFT_CONFIG_ROOT:-${TMPDIR}/openshift-dind-cluster/${CLUSTER_ID}}"
+DEPLOYED_CONFIG_ROOT="/data"
+
+MASTER_NAME="${CLUSTER_ID}-master"
+NODE_PREFIX="${CLUSTER_ID}-node-"
+NODE_COUNT=2
+NODE_NAMES=()
+for (( i=1; i<=NODE_COUNT; i++ )); do
+  NODE_NAMES+=( "${NODE_PREFIX}${i}" )
+done
+
+BASE_IMAGE="openshift/dind"
+NODE_IMAGE="openshift/dind-node"
+MASTER_IMAGE="openshift/dind-master"
 
 case "${1:-""}" in
   start)
-    start
+    BUILD=
+    BUILD_IMAGES=
+    WAIT_FOR_CLUSTER=1
+    NETWORK_PLUGIN=
+    REMOVE_EXISTING_CLUSTER=
+    OPTIND=2
+    while getopts ":bin:rs" opt; do
+      case $opt in
+        b)
+          BUILD=1
+          ;;
+        i)
+          BUILD_IMAGES=1
+          ;;
+        n)
+          NETWORK_PLUGIN="${OPTARG}"
+          ;;
+        r)
+          REMOVE_EXISTING_CLUSTER=1
+          ;;
+        s)
+          WAIT_FOR_CLUSTER=
+          ;;
+        \?)
+          echo "Invalid option: -${OPTARG}" >&2
+          exit 1
+          ;;
+        :)
+          echo "Option -${OPTARG} requires an argument." >&2
+          exit 1
+          ;;
+      esac
+    done
+
+    if [[ -n "${REMOVE_EXISTING_CLUSTER}" ]]; then
+      stop "${CONFIG_ROOT}" "${CLUSTER_ID}"
+    fi
+
+    # Build origin if requested or required
+    if [[ -n "${BUILD}" ]] || ! os::util::find::built_binary 'oc' >/dev/null 2>&1; then
+      "${OS_ROOT}/hack/build-go.sh"
+    fi
+
+    # Build images if requested or required
+    if [[ -n "${BUILD_IMAGES}" ||
+            -z "$(${DOCKER_CMD} images -q ${MASTER_IMAGE})" ]]; then
+      build-images "${OS_ROOT}"
+    fi
+
+    NETWORK_PLUGIN="$(get-network-plugin "${NETWORK_PLUGIN}")"
+    start "${OS_ROOT}" "${CONFIG_ROOT}" "${DEPLOYED_CONFIG_ROOT}" \
+          "${CLUSTER_ID}" "${NETWORK_PLUGIN}" "${WAIT_FOR_CLUSTER}" \
+          "${NODE_COUNT}" "${NODE_PREFIX}"
     ;;
   stop)
-    stop
+    stop "${CONFIG_ROOT}" "${CLUSTER_ID}"
     ;;
-  restart)
-    stop
-    start
+  wait-for-cluster)
+    wait-for-cluster "${CONFIG_ROOT}" "${NODE_COUNT}"
     ;;
   build-images)
-    BUILD_IMAGES=1
-    build-images
-    ;;
-  wipe)
-    wipe-config
-    ;;
-  wipe-restart)
-    stop
-    wipe-config
-    start
+    build-images "${OS_ROOT}"
     ;;
   *)
-    echo "Usage: $0 {start|stop|restart|build-images|wipe|wipe-restart}"
+    >&2 echo "Usage: $0 {start|stop|wait-for-cluster|build-images} [options]
+
+start accepts the following options:
+
+ -n [net plugin]   the name of the network plugin to deploy
+
+ -b                build origin before starting the cluster
+
+ -i                build container images before starting the cluster
+
+ -r                remove an existing cluster
+
+ -s                skip waiting for nodes to become ready
+"
     exit 2
 esac

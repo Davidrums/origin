@@ -2,9 +2,8 @@ package testclient
 
 import (
 	kapi "k8s.io/kubernetes/pkg/api"
-	ktestclient "k8s.io/kubernetes/pkg/client/testclient"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/client/testing/core"
 
 	projectapi "github.com/openshift/origin/pkg/project/api"
 )
@@ -15,17 +14,19 @@ type FakeProjectRequests struct {
 	Fake *Fake
 }
 
-func (c *FakeProjectRequests) List(label labels.Selector, field fields.Selector) (*kapi.Status, error) {
-	obj, err := c.Fake.Invokes(ktestclient.NewRootListAction("newprojects", label, field), &kapi.Status{})
+var newProjectsResource = unversioned.GroupVersionResource{Group: "", Version: "", Resource: "newprojects"}
+
+func (c *FakeProjectRequests) List(opts kapi.ListOptions) (*unversioned.Status, error) {
+	obj, err := c.Fake.Invokes(core.NewRootListAction(newProjectsResource, opts), &unversioned.Status{})
 	if obj == nil {
 		return nil, err
 	}
 
-	return obj.(*kapi.Status), err
+	return obj.(*unversioned.Status), err
 }
 
 func (c *FakeProjectRequests) Create(inObj *projectapi.ProjectRequest) (*projectapi.Project, error) {
-	obj, err := c.Fake.Invokes(ktestclient.NewRootCreateAction("newprojects", inObj), &projectapi.Project{})
+	obj, err := c.Fake.Invokes(core.NewRootCreateAction(newProjectsResource, inObj), &projectapi.Project{})
 	if obj == nil {
 		return nil, err
 	}

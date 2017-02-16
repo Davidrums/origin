@@ -7,7 +7,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/sets"
+
+	// install all APIs
+	_ "github.com/openshift/origin/pkg/api/install"
+	_ "k8s.io/kubernetes/pkg/api/install"
 )
 
 func TestNodeConfigNonTLS(t *testing.T) {
@@ -28,9 +32,9 @@ func TestNodeConfigNonTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to read %v", configDirName)
 	}
-	filenames := util.NewStringSet(fileNameSlice...)
+	filenames := sets.NewString(fileNameSlice...)
 
-	expectedNames := util.NewStringSet("master-client.crt", "master-client.key", "node.kubeconfig", "node-config.yaml", "node-registration.json", "ca.crt")
+	expectedNames := sets.NewString("master-client.crt", "master-client.key", "node.kubeconfig", "node-config.yaml", "node-registration.json", "ca.crt")
 	if !filenames.HasAll(expectedNames.List()...) || !expectedNames.HasAll(filenames.List()...) {
 		t.Errorf("expected %v, got %v", expectedNames.List(), filenames.List())
 	}
@@ -54,9 +58,9 @@ func TestNodeConfigTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to read %v", configDirName)
 	}
-	filenames := util.NewStringSet(fileNameSlice...)
+	filenames := sets.NewString(fileNameSlice...)
 
-	expectedNames := util.NewStringSet("master-client.crt", "master-client.key", "server.crt", "server.key", "node-client-ca.crt", "node.kubeconfig", "node-config.yaml", "node-registration.json", "ca.crt")
+	expectedNames := sets.NewString("master-client.crt", "master-client.key", "server.crt", "server.key", "node-client-ca.crt", "node.kubeconfig", "node-config.yaml", "node-registration.json", "ca.crt")
 	if !filenames.HasAll(expectedNames.List()...) || !expectedNames.HasAll(filenames.List()...) {
 		t.Errorf("expected %v, got %v", expectedNames.List(), filenames.List())
 	}
@@ -71,6 +75,7 @@ func makeSignerCert(t *testing.T) (string, string, string) {
 		CertFile:   certFile.Name(),
 		KeyFile:    keyFile.Name(),
 		SerialFile: serialFile.Name(),
+		ExpireDays: 365,
 		Name:       "unit-test-signer",
 		Overwrite:  true,
 	}

@@ -5,10 +5,15 @@
     "name": "zookeeper",
     "creationTimestamp": null,
     "annotations": {
-      "description": "Example of replicated Zookeeper 3.4.6 server",
+      "openshift.io/display-name": "Zookeeper",
+      "description": "An example of a replicated Zookeeper 3.4.6 server. For more information about using this template, including OpenShift considerations, see https://github.com/openshift/origin/blob/master/examples/zookeeper/README.md.",
       "iconClass": "icon-database",
       "tags": "database,zookeeper"
     }
+  },
+  "message": "The following service(s) have been created in your project: zookeeper.\n\nFor more information about using this template, including OpenShift considerations, see https://github.com/openshift/origin/blob/master/examples/zookeeper/README.md.",
+  "labels": {
+    "template": "zookeeper"
   },
   "objects": [
     {
@@ -210,6 +215,20 @@
         }
       },
       "spec": {
+        "volumes": [
+          {
+            "name": "conf",
+            "emptyDir": {}
+          },
+          {
+            "name": "data",
+            "emptyDir": {}
+          },
+          {
+            "name": "log",
+            "emptyDir": {}
+          }
+        ],
         "containers": [
           {
             "name": "server",
@@ -232,6 +251,20 @@
               {
                 "name": "SERVER_ID",
                 "value": "1"
+              }
+            ],
+            "volumeMounts": [
+              {
+                "name": "conf",
+                "mountPath": "/opt/zookeeper/conf"
+              },
+              {
+                "name": "data",
+                "mountPath": "/opt/zookeeper/data"
+              },
+              {
+                "name": "log",
+                "mountPath": "/opt/zookeeper/log"
               }
             ],
             "resources": {},
@@ -260,6 +293,20 @@
         }
       },
       "spec": {
+        "volumes": [
+          {
+            "name": "conf",
+            "emptyDir": {}
+          },
+          {
+            "name": "data",
+            "emptyDir": {}
+          },
+          {
+            "name": "log",
+            "emptyDir": {}
+          }
+        ],
         "containers": [
           {
             "name": "server",
@@ -282,6 +329,20 @@
               {
                 "name": "SERVER_ID",
                 "value": "2"
+              }
+            ],
+            "volumeMounts": [
+              {
+                "name": "conf",
+                "mountPath": "/opt/zookeeper/conf"
+              },
+              {
+                "name": "data",
+                "mountPath": "/opt/zookeeper/data"
+              },
+              {
+                "name": "log",
+                "mountPath": "/opt/zookeeper/log"
               }
             ],
             "resources": {},
@@ -310,6 +371,20 @@
         }
       },
       "spec": {
+        "volumes": [
+          {
+            "name": "conf",
+            "emptyDir": {}
+          },
+          {
+            "name": "data",
+            "emptyDir": {}
+          },
+          {
+            "name": "log",
+            "emptyDir": {}
+          }
+        ],
         "containers": [
           {
             "name": "server",
@@ -334,6 +409,20 @@
                 "value": "3"
               }
             ],
+            "volumeMounts": [
+              {
+                "name": "conf",
+                "mountPath": "/opt/zookeeper/conf"
+              },
+              {
+                "name": "data",
+                "mountPath": "/opt/zookeeper/data"
+              },
+              {
+                "name": "log",
+                "mountPath": "/opt/zookeeper/log"
+              }
+            ],
             "resources": {},
             "terminationMessagePath": "/dev/termination-log",
             "imagePullPolicy": "IfNotPresent",
@@ -356,8 +445,5 @@
       "description": "The name of Zookeeper Docker image to use",
       "value": "openshift/zookeeper-346-fedora20"
     }
-  ],
-  "labels": {
-    "template": "zookeeper"
-  }
+  ]
 }

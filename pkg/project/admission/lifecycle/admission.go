@@ -1,38 +1,22 @@
-/*
-Copyright 2014 Google Inc. All rights reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-package admission
+package lifecycle
 
 import (
 	"fmt"
 	"io"
 	"math/rand"
-	"strings"
 	"time"
 
 	"github.com/golang/glog"
 
 	"k8s.io/kubernetes/pkg/admission"
-	kapi "k8s.io/kubernetes/pkg/api"
-	apierrors "k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/api/meta"
-	"k8s.io/kubernetes/pkg/client"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/apimachinery/registered"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 
 	"github.com/openshift/origin/pkg/api/latest"
+	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
+	oadmission "github.com/openshift/origin/pkg/cmd/server/admission"
 	"github.com/openshift/origin/pkg/project/cache"
 	projectutil "github.com/openshift/origin/pkg/project/util"
 )
@@ -40,66 +24,63 @@ import (
 // TODO: modify the upstream plug-in so this can be collapsed
 // need ability to specify a RESTMapper on upstream version
 func init() {
-	admission.RegisterPlugin("OriginNamespaceLifecycle", func(client client.Interface, config io.Reader) (admission.Interface, error) {
+	admission.RegisterPlugin("OriginNamespaceLifecycle", func(client clientset.Interface, config io.Reader) (admission.Interface, error) {
 		return NewLifecycle(client, recommendedCreatableResources)
 	})
 }
 
 type lifecycle struct {
-	client client.Interface
+	client clientset.Interface
+	cache  *cache.ProjectCache
 
 	// creatableResources is a set of resources that can be created even if the namespace is terminating
-	creatableResources util.StringSet
+	creatableResources map[unversioned.GroupResource]bool
 }
 
-var recommendedCreatableResources = util.NewStringSet("subjectaccessreviews", "resourceaccessreviews")
+var recommendedCreatableResources = map[unversioned.GroupResource]bool{
+	authorizationapi.Resource("resourceaccessreviews"):      true,
+	authorizationapi.Resource("localresourceaccessreviews"): true,
+	authorizationapi.Resource("subjectaccessreviews"):       true,
+	authorizationapi.Resource("localsubjectaccessreviews"):  true,
+	authorizationapi.Resource("selfsubjectrulesreviews"):    true,
+	authorizationapi.Resource("subjectrulesreviews"):        true,
+}
+var _ = oadmission.WantsProjectCache(&lifecycle{})
 
-// Admit enforces that a namespace must exist in order to associate content with it.
-// Admit enforces that a namespace that is terminating cannot accept new content being associated with it.
+// Admit enforces that a namespace must have the openshift finalizer associated with it in order to create origin API objects within it
 func (e *lifecycle) Admit(a admission.Attributes) (err error) {
 	if len(a.GetNamespace()) == 0 {
 		return nil
 	}
-	defaultVersion, kind, err := latest.RESTMapper.VersionAndKindForResource(a.GetResource())
+	// only pay attention to origin resources
+	if !latest.OriginKind(a.GetKind()) {
+		return nil
+	}
+	// always allow creatable resources through.  These requests should always be allowed.
+	if e.creatableResources[a.GetResource().GroupResource()] {
+		return nil
+	}
+
+	groupMeta, err := registered.Group(a.GetKind().Group)
+	if err != nil {
+		return err
+	}
+	mapping, err := groupMeta.RESTMapper.RESTMapping(a.GetKind().GroupKind())
 	if err != nil {
 		glog.V(4).Infof("Ignoring life-cycle enforcement for resource %v; no associated default version and kind could be found.", a.GetResource())
 		return nil
-	}
-	mapping, err := latest.RESTMapper.RESTMapping(kind, defaultVersion)
-	if err != nil {
-		return admission.NewForbidden(a, err)
 	}
 	if mapping.Scope.Name() != meta.RESTScopeNameNamespace {
 		return nil
 	}
 
-	// we want to allow someone to delete something in case it was phantom created somehow
-	if a.GetOperation() == "DELETE" {
-		return nil
-	}
-
-	name := "Unknown"
-	obj := a.GetObject()
-	if obj != nil {
-		name, _ = meta.NewAccessor().Name(obj)
-	}
-
-	projects, err := cache.GetProjectCache()
-	if err != nil {
+	if !e.cache.Running() {
 		return admission.NewForbidden(a, err)
 	}
 
-	namespace, err := projects.GetNamespaceObject(a.GetNamespace())
+	namespace, err := e.cache.GetNamespace(a.GetNamespace())
 	if err != nil {
 		return admission.NewForbidden(a, err)
-	}
-
-	if a.GetOperation() != "CREATE" {
-		return nil
-	}
-
-	if namespace.Status.Phase == kapi.NamespaceTerminating && !e.creatableResources.Has(strings.ToLower(a.GetResource())) {
-		return apierrors.NewForbidden(kind, name, fmt.Errorf("Namespace %s is terminating", a.GetNamespace()))
 	}
 
 	// in case of concurrency issues, we will retry this logic
@@ -122,7 +103,7 @@ func (e *lifecycle) Admit(a admission.Attributes) (err error) {
 		time.Sleep(interval)
 
 		// it's possible the namespace actually was deleted, so just forbid if this occurs
-		namespace, err = e.client.Namespaces().Get(a.GetNamespace())
+		namespace, err = e.client.Core().Namespaces().Get(a.GetNamespace())
 		if err != nil {
 			return admission.NewForbidden(a, err)
 		}
@@ -131,9 +112,23 @@ func (e *lifecycle) Admit(a admission.Attributes) (err error) {
 }
 
 func (e *lifecycle) Handles(operation admission.Operation) bool {
-	return true
+	return operation == admission.Create
 }
 
-func NewLifecycle(client client.Interface, creatableResources util.StringSet) (admission.Interface, error) {
-	return &lifecycle{client: client, creatableResources: creatableResources}, nil
+func (e *lifecycle) SetProjectCache(c *cache.ProjectCache) {
+	e.cache = c
+}
+
+func (e *lifecycle) Validate() error {
+	if e.cache == nil {
+		return fmt.Errorf("project lifecycle plugin needs a project cache")
+	}
+	return nil
+}
+
+func NewLifecycle(client clientset.Interface, creatableResources map[unversioned.GroupResource]bool) (admission.Interface, error) {
+	return &lifecycle{
+		client:             client,
+		creatableResources: creatableResources,
+	}, nil
 }

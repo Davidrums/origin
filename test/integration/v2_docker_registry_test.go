@@ -1,5 +1,3 @@
-// +build integration,etcd
-
 package integration
 
 import (
@@ -8,53 +6,58 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/distribution/digest"
 	"github.com/docker/distribution/manifest"
+	"github.com/docker/distribution/manifest/schema1"
 	_ "github.com/docker/distribution/registry/storage/driver/inmemory"
 	"github.com/docker/libtrust"
+
+	kapi "k8s.io/kubernetes/pkg/api"
+
 	"github.com/openshift/origin/pkg/cmd/dockerregistry"
+	cmdutil "github.com/openshift/origin/pkg/cmd/util"
 	"github.com/openshift/origin/pkg/cmd/util/tokencmd"
+	registryutil "github.com/openshift/origin/pkg/dockerregistry/testutil"
 	imageapi "github.com/openshift/origin/pkg/image/api"
 	testutil "github.com/openshift/origin/test/util"
-	kapi "k8s.io/kubernetes/pkg/api"
+	testserver "github.com/openshift/origin/test/util/server"
 )
 
-func init() {
-	testutil.RequireEtcd()
-}
-
-func signedManifest(name string) ([]byte, digest.Digest, error) {
+func signedManifest(name string, blobs []digest.Digest) ([]byte, digest.Digest, error) {
 	key, err := libtrust.GenerateECP256PrivateKey()
 	if err != nil {
 		return []byte{}, "", fmt.Errorf("error generating EC key: %s", err)
 	}
 
-	mappingManifest := manifest.Manifest{
+	history := make([]schema1.History, 0, len(blobs))
+	fsLayers := make([]schema1.FSLayer, 0, len(blobs))
+	for _, b := range blobs {
+		history = append(history, schema1.History{V1Compatibility: `{"id": "foo"}`})
+		fsLayers = append(fsLayers, schema1.FSLayer{BlobSum: b})
+	}
+
+	mappingManifest := schema1.Manifest{
 		Versioned: manifest.Versioned{
 			SchemaVersion: 1,
 		},
 		Name:         name,
 		Tag:          imageapi.DefaultImageTag,
 		Architecture: "amd64",
-		History: []manifest.History{
-			{
-				V1Compatibility: `{"id": "foo"}`,
-			},
-		},
+		History:      history,
+		FSLayers:     fsLayers,
 	}
 
 	manifestBytes, err := json.MarshalIndent(mappingManifest, "", "    ")
 	if err != nil {
 		return []byte{}, "", fmt.Errorf("error marshaling manifest: %s", err)
 	}
-	dgst, err := digest.FromBytes(manifestBytes)
-	if err != nil {
-		return []byte{}, "", fmt.Errorf("error calculating manifest digest: %s", err)
-	}
+	dgst := digest.FromBytes(manifestBytes)
 
 	jsonSignature, err := libtrust.NewJSONSignature(manifestBytes)
 	if err != nil {
@@ -74,7 +77,9 @@ func signedManifest(name string) ([]byte, digest.Digest, error) {
 }
 
 func TestV2RegistryGetTags(t *testing.T) {
-	_, clusterAdminKubeConfig, err := testutil.StartTestMaster()
+	testutil.RequireEtcd(t)
+	defer testutil.DumpEtcdOnFailure(t)
+	_, clusterAdminKubeConfig, err := testserver.StartTestMasterAPI()
 	if err != nil {
 		t.Fatalf("error starting master: %v", err)
 	}
@@ -87,7 +92,7 @@ func TestV2RegistryGetTags(t *testing.T) {
 		t.Fatalf("error getting cluster admin client config: %v", err)
 	}
 	user := "admin"
-	adminClient, err := testutil.CreateNewProject(clusterAdminClient, *clusterAdminClientConfig, testutil.Namespace(), user)
+	adminClient, err := testserver.CreateNewProject(clusterAdminClient, *clusterAdminClientConfig, testutil.Namespace(), user)
 	if err != nil {
 		t.Fatalf("error creating project: %v", err)
 	}
@@ -97,7 +102,8 @@ func TestV2RegistryGetTags(t *testing.T) {
 	}
 
 	config := `version: 0.1
-loglevel: debug
+log:
+  level: debug
 http:
   addr: 127.0.0.1:5000
 storage:
@@ -105,7 +111,11 @@ storage:
 auth:
   openshift:
 middleware:
+  registry:
+    - name: openshift
   repository:
+    - name: openshift
+  storage:
     - name: openshift
 `
 
@@ -113,9 +123,13 @@ middleware:
 	os.Setenv("OPENSHIFT_CERT_DATA", string(clusterAdminClientConfig.CertData))
 	os.Setenv("OPENSHIFT_KEY_DATA", string(clusterAdminClientConfig.KeyData))
 	os.Setenv("OPENSHIFT_MASTER", clusterAdminClientConfig.Host)
-	os.Setenv("REGISTRY_URL", "127.0.0.1:5000")
+	os.Setenv("DOCKER_REGISTRY_URL", "127.0.0.1:5000")
 
 	go dockerregistry.Execute(strings.NewReader(config))
+
+	if err := cmdutil.WaitForSuccessfulDial(false, "tcp", "127.0.0.1:5000", 100*time.Millisecond, 1*time.Second, 35); err != nil {
+		t.Fatal(err)
+	}
 
 	stream := imageapi.ImageStream{
 		ObjectMeta: kapi.ObjectMeta{
@@ -133,6 +147,11 @@ middleware:
 	}
 	if len(tags) > 0 {
 		t.Fatalf("expected 0 tags, got: %#v", tags)
+	}
+
+	err = putEmptyBlob(stream.Name, user, token)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	dgst, err := putManifest(stream.Name, user, token)
@@ -167,7 +186,7 @@ middleware:
 		t.Fatalf("unexpected status code: %d", resp.StatusCode)
 	}
 	body, err := ioutil.ReadAll(resp.Body)
-	var retrievedManifest manifest.Manifest
+	var retrievedManifest schema1.Manifest
 	if err := json.Unmarshal(body, &retrievedManifest); err != nil {
 		t.Fatalf("error unmarshaling retrieved manifest")
 	}
@@ -208,7 +227,7 @@ middleware:
 	if err != nil {
 		t.Fatalf("error getting imageStreamImage: %s", err)
 	}
-	if e, a := fmt.Sprintf("test@%s", dgst.Hex()[:7]), image.Name; e != a {
+	if e, a := fmt.Sprintf("test@%s", dgst.String()), image.Name; e != a {
 		t.Errorf("image name: expected %q, got %q", e, a)
 	}
 	if e, a := dgst.String(), image.Image.Name; e != a {
@@ -226,6 +245,11 @@ middleware:
 	t.Logf("otherStream=%#v, err=%v", otherStream, err)
 	if err == nil {
 		t.Fatalf("expected error getting otherrepo")
+	}
+
+	err = putEmptyBlob("otherrepo", user, token)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	otherDigest, err := putManifest("otherrepo", user, token)
@@ -256,8 +280,14 @@ middleware:
 }
 
 func putManifest(name, user, token string) (digest.Digest, error) {
+	creds := registryutil.NewBasicCredentialStore(user, token)
+	desc, _, err := registryutil.UploadTestBlob(&url.URL{Host: "127.0.0.1:5000", Scheme: "http"}, creds, testutil.Namespace()+"/"+name)
+	if err != nil {
+		return "", err
+	}
+
 	putUrl := fmt.Sprintf("http://127.0.0.1:5000/v2/%s/%s/manifests/%s", testutil.Namespace(), name, imageapi.DefaultImageTag)
-	signedManifest, dgst, err := signedManifest(fmt.Sprintf("%s/%s", testutil.Namespace(), name))
+	signedManifest, dgst, err := signedManifest(fmt.Sprintf("%s/%s", testutil.Namespace(), name), []digest.Digest{desc.Digest})
 	if err != nil {
 		return "", err
 	}
@@ -272,10 +302,41 @@ func putManifest(name, user, token string) (digest.Digest, error) {
 		return "", fmt.Errorf("error putting manifest: %s", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
+	if resp.StatusCode != http.StatusCreated {
 		return "", fmt.Errorf("unexpected put status code: %d", resp.StatusCode)
 	}
 	return dgst, nil
+}
+
+func putEmptyBlob(name, user, token string) error {
+	putUrl := fmt.Sprintf("http://127.0.0.1:5000/v2/%s/%s/blobs/uploads/", testutil.Namespace(), name)
+	method := "POST"
+
+	for range []int{1, 2} {
+		req, err := http.NewRequest(method, putUrl, bytes.NewReader(gzippedEmptyTar))
+		if err != nil {
+			return fmt.Errorf("error makeing request: %s", err)
+		}
+		req.SetBasicAuth(user, token)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("error posting blob: %s", err)
+		}
+		resp.Body.Close()
+
+		switch resp.StatusCode {
+		case http.StatusAccepted:
+			putUrl = resp.Header.Get("Location") + "&digest=" + digestSHA256GzippedEmptyTar.String()
+			method = "PUT"
+		case http.StatusCreated:
+			return nil
+		default:
+			return fmt.Errorf("unexpected post status code: %d", resp.StatusCode)
+		}
+	}
+
+	return nil
 }
 
 func getTags(streamName, user, token string) ([]string, error) {

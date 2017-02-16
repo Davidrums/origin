@@ -1,5 +1,3 @@
-// +build integration,etcd
-
 package integration
 
 import (
@@ -8,27 +6,25 @@ import (
 
 	"github.com/spf13/pflag"
 
-	kclient "k8s.io/kubernetes/pkg/client"
-	"k8s.io/kubernetes/pkg/client/clientcmd"
-	clientcmdapi "k8s.io/kubernetes/pkg/client/clientcmd/api"
+	"k8s.io/kubernetes/pkg/client/restclient"
+	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
 
 	"github.com/openshift/origin/pkg/client"
 	newproject "github.com/openshift/origin/pkg/cmd/admin/project"
 	"github.com/openshift/origin/pkg/cmd/cli/cmd"
+	"github.com/openshift/origin/pkg/cmd/cli/cmd/login"
 	"github.com/openshift/origin/pkg/cmd/cli/config"
 	"github.com/openshift/origin/pkg/cmd/server/bootstrappolicy"
 	"github.com/openshift/origin/pkg/user/api"
 	testutil "github.com/openshift/origin/test/util"
+	testserver "github.com/openshift/origin/test/util/server"
 )
 
-func init() {
-	testutil.RequireEtcd()
-}
-
 func TestLogin(t *testing.T) {
-	clientcmd.DefaultCluster = clientcmdapi.Cluster{Server: ""}
+	testutil.RequireEtcd(t)
+	defer testutil.DumpEtcdOnFailure(t)
 
-	_, clusterAdminKubeConfig, err := testutil.StartTestMaster()
+	_, clusterAdminKubeConfig, err := testserver.StartTestMasterAPI()
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -121,7 +117,7 @@ func TestLogin(t *testing.T) {
 
 }
 
-func newLoginOptions(server string, username string, password string, insecure bool) *cmd.LoginOptions {
+func newLoginOptions(server string, username string, password string, insecure bool) *login.LoginOptions {
 	flagset := pflag.NewFlagSet("test-flags", pflag.ContinueOnError)
 	flags := []string{}
 	clientConfig := defaultClientConfig(flagset)
@@ -129,7 +125,7 @@ func newLoginOptions(server string, username string, password string, insecure b
 
 	startingConfig, _ := clientConfig.RawConfig()
 
-	loginOptions := &cmd.LoginOptions{
+	loginOptions := &login.LoginOptions{
 		Server:             server,
 		StartingKubeConfig: &startingConfig,
 		Username:           username,
@@ -142,7 +138,7 @@ func newLoginOptions(server string, username string, password string, insecure b
 	return loginOptions
 }
 
-func whoami(clientCfg *kclient.Config) (*api.User, error) {
+func whoami(clientCfg *restclient.Config) (*api.User, error) {
 	oClient, err := client.New(clientCfg)
 	if err != nil {
 		return nil, err
